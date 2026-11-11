@@ -26,11 +26,13 @@ from lithium_systemgroup import (
     extract_bom_id_from_url,
     extract_export_url_base,
     list_revisions_for_part,
+    load_bom_list_entries,
     match_bom_list_entries,
     normalize_crm_decimal,
     normalize_order_quantity,
     parse_bom_document,
     parse_bom_list_document,
+    parse_bom_list_pager,
     parse_customer_orders_document,
     parse_login_form,
     resolve_bom_from_list,
@@ -257,6 +259,137 @@ class ClientTests(unittest.TestCase):
         body, ctype = client.fetch_bom(39477)
         self.assertIn("BomLinesGrid", body)
         self.assertIn("text/html", ctype)
+
+    def test_parse_bom_list_pager_page1(self):
+        html = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        pager = parse_bom_list_pager(html)
+        self.assertIsNotNone(pager)
+        assert pager is not None
+        self.assertEqual(pager.current_page, 1)
+        self.assertEqual(pager.page_count, 2)
+        self.assertTrue(pager.next_enabled)
+        self.assertEqual(
+            pager.pager_target,
+            "lstEntities$Grid$MasterTableView$ctl03$ctl02$Pager",
+        )
+        self.assertEqual(pager.fields.get("__EVENTVALIDATION"), "ev-page1")
+
+    def test_parse_bom_list_pager_unicode_escaped_quotes(self):
+        # Live CRM $create blobs use \u0027 instead of raw quotes.
+        html = (
+            '<form action="./List.aspx?EntityName=Bom">'
+            '<input type="hidden" name="__EVENTVALIDATION" value="ev" />'
+            '<div class="EntityListPaging">'
+            '<input id="x_cboPage_Input" value="صفحه1" />'
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+            '<li class="rcbItem ">صفحه3</li></ul>'
+            '<li class="rtbItem rtbBtn"><a title="بعدی" href="#"></a></li>'
+            "</div>"
+            r'<script>$create({_rawPostBackReference:"WebForm_DoPostBackWithOptions('
+            r"new WebForm_PostBackOptions(\u0027lstEntities$Grid$MasterTableView$"
+            r"ctl03$ctl02$Pager\u0027, \u0027{0}\u0027, true, \u0027{1}\u0027, "
+            r'\u0027\u0027, false, true))"});</script>'
+            "</form>"
+        )
+        pager = parse_bom_list_pager(html)
+        self.assertIsNotNone(pager)
+        assert pager is not None
+        self.assertEqual(
+            pager.pager_target,
+            "lstEntities$Grid$MasterTableView$ctl03$ctl02$Pager",
+        )
+        self.assertEqual(pager.page_count, 3)
+
+    def test_parse_bom_list_pager_page2_next_disabled(self):
+        html = (FIXTURES / "bom_list_page2.html").read_text(encoding="utf-8")
+        pager = parse_bom_list_pager(html)
+        self.assertIsNotNone(pager)
+        assert pager is not None
+        self.assertEqual(pager.current_page, 2)
+        self.assertEqual(pager.page_count, 2)
+        self.assertFalse(pager.next_enabled)
+
+    def test_iter_bom_list_pages_walks_next_postback(self):
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        page2 = (FIXTURES / "bom_list_page2.html").read_text(encoding="utf-8")
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx?ComponentName=SystemGroup.PAC.Engineering&EntityName=Bom",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        next_post = mock.Mock(
+            status_code=200,
+            text=page2,
+            url="http://crm/List.aspx?ComponentName=SystemGroup.PAC.Engineering&EntityName=Bom",
+            headers={"Content-Type": "text/html"},
+        )
+        next_post.raise_for_status = mock.Mock()
+        session.get.side_effect = [login_get, list_get]
+        session.post.side_effect = [login_post, next_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        pages = list(client.iter_bom_list_pages())
+        self.assertEqual(len(pages), 2)
+        self.assertIn("صفحه1", pages[0][0])
+        self.assertIn("صفحه2", pages[1][0])
+        # Second session.post is the pager Next (after login post).
+        next_call = session.post.call_args_list[1]
+        posted = next_call.kwargs.get("data") or next_call.args[1]
+        self.assertEqual(
+            posted["__EVENTTARGET"],
+            "lstEntities$Grid$MasterTableView$ctl03$ctl02$Pager",
+        )
+        self.assertEqual(posted["__EVENTARGUMENT"], "Next")
+        self.assertEqual(posted["__EVENTVALIDATION"], "ev-page1")
+
+    def test_load_bom_list_entries_merges_pages(self):
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        page2 = (FIXTURES / "bom_list_page2.html").read_text(encoding="utf-8")
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        next_post = mock.Mock(
+            status_code=200,
+            text=page2,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        next_post.raise_for_status = mock.Mock()
+        session.get.side_effect = [login_get, list_get]
+        session.post.side_effect = [login_post, next_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        entries = load_bom_list_entries(client=client)
+        ids = [e.bom_id for e in entries]
+        self.assertEqual(ids, ["39477", "40001", "41000", "42000"])
 
     def test_customer_orders_report_url_uses_base(self):
         url = customer_orders_report_url("http://crm.example/", "ReportViewer.aspx?x=1")
