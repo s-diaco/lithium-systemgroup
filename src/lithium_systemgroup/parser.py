@@ -1,13 +1,17 @@
-"""Parse SystemGroup login forms, BoM Edit, and BoM List HTML/JSON.
+"""Parse SystemGroup login forms, BoM Edit/List, and customer-order report exports.
 
 Edit: prefer ``window.eds_BomMaterials_updatedData`` (PartCode/Quantity);
 rgRow cells are often empty. Header via ``nrgNumber`` / ``sltBomPart``.
-List: Telerik ``MasterTableView_Header`` + ``rgRow``. Fixtures:
-``bom_edit_telerik.html``, ``bom_edit_materials.json``, ``bom_list_telerik.*``.
+List: Telerik ``MasterTableView_Header`` + ``rgRow``. Orders: ReportViewer
+CSV export (store delivery notes with remaining balance). Fixtures:
+``bom_edit_telerik.html``, ``bom_edit_materials.json``, ``bom_list_telerik.*``,
+``customer_orders.csv``.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 from dataclasses import dataclass, field
@@ -102,6 +106,38 @@ class ParsedBom:
     parent_description: str = ""
     lines: list[BomLine] = field(default_factory=list)
     source: str = "unknown"
+
+
+@dataclass
+class CustomerOrderLine:
+    """One product line from the store delivery-note (حواله فروش) report."""
+
+    sales_office: str = ""
+    customer_name: str = ""
+    delivery_note_date: str = ""
+    product_code: str = ""
+    product_title: str = ""
+    note_quantity: str = ""
+    delivered_quantity: str = ""
+    remaining_quantity: str = ""
+    warehouse_delivery_date: str = ""
+    delivery_note_number: str = ""
+    notes: str = ""
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "sales_office": self.sales_office.strip(),
+            "customer_name": self.customer_name.strip(),
+            "delivery_note_date": self.delivery_note_date.strip(),
+            "product_code": self.product_code.strip(),
+            "product_title": self.product_title.strip(),
+            "note_quantity": self.note_quantity.strip(),
+            "delivered_quantity": self.delivered_quantity.strip(),
+            "remaining_quantity": self.remaining_quantity.strip(),
+            "warehouse_delivery_date": self.warehouse_delivery_date.strip(),
+            "delivery_note_number": self.delivery_note_number.strip(),
+            "notes": self.notes.strip(),
+        }
 
 
 # --- Login form ---------------------------------------------------------------
@@ -1291,4 +1327,201 @@ def match_bom_list_entries(
             if (e.description or "").strip().casefold() == desc
         ]
     return []
+
+
+# --- Customer orders (ReportViewer CSV export) ---------------------------------
+
+_ORDER_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
+    "sales_office": (
+        "sales_office",
+        "sales office",
+        "مرکز_فروش",
+        "مرکز فروش",
+        "مرکزفروش",
+    ),
+    "customer_name": (
+        "customer_name",
+        "customer",
+        "customer name",
+        "مشتري",
+        "مشتری",
+        "نام مشتری",
+        "نام_مشتری",
+    ),
+    "delivery_note_date": (
+        "delivery_note_date",
+        "note_date",
+        "تاريخ_حواله1",
+        "تاریخ_حواله",
+        "تاریخ حواله",
+        "تاريخ حواله",
+    ),
+    "product_code": (
+        "product_code",
+        "part_number",
+        "کد_محصول1",
+        "کد_محصول",
+        "کد محصول",
+        "کدکالا",
+    ),
+    "product_title": (
+        "product_title",
+        "description",
+        "عنوان_محصول2",
+        "عنوان_محصول",
+        "عنوان محصول",
+    ),
+    "note_quantity": (
+        "note_quantity",
+        "quantity",
+        "مقدار_حواله1",
+        "مقدار_حواله",
+        "مقدار حواله",
+    ),
+    "delivered_quantity": (
+        "delivered_quantity",
+        "delivered",
+        "مقدار_تحویل",
+        "مقدار تحویل",
+    ),
+    "remaining_quantity": (
+        "remaining_quantity",
+        "remaining",
+        "مانده",
+    ),
+    "warehouse_delivery_date": (
+        "warehouse_delivery_date",
+        "تاریخ_تحویل_انبار",
+        "تاریخ تحویل انبار",
+    ),
+    "delivery_note_number": (
+        "delivery_note_number",
+        "note_number",
+        "شماره_حواله",
+        "شماره حواله",
+    ),
+    "notes": (
+        "notes",
+        "comments",
+        "توضیحات",
+    ),
+}
+
+# Skip aggregate / repeated footer-ish CSV columns from the SSRS tablix flatten.
+_ORDER_SKIP_HEADERS = frozenset(
+    {
+        "مشتري1",
+        "مشتری1",
+        "مقدار_حواله2",
+        "مقدار_تحویل2",
+        "مقدار_حواله",
+        "مقدار_تحویل1",
+        "textbox72",
+        "textbox37",
+    }
+)
+
+
+def _normalize_order_header(raw: str) -> str | None:
+    key = re.sub(r"\s+", " ", (raw or "").strip().lower())
+    key = key.replace("-", " ").replace("_", " ")
+    compact = key.replace(" ", "")
+    if compact in {s.replace("_", "").replace(" ", "").lower() for s in _ORDER_SKIP_HEADERS}:
+        return None
+    for field_name, aliases in _ORDER_HEADER_ALIASES.items():
+        for alias in aliases:
+            a = alias.lower().replace("_", " ")
+            if key == a or compact == a.replace(" ", ""):
+                return field_name
+    return None
+
+
+def normalize_order_quantity(raw: str) -> str:
+    """Strip thousand separators from report quantities (``1,000`` / ``1،000``)."""
+    text = _BIDI_AND_FMT.sub("", raw or "").strip()
+    if not text:
+        return ""
+    # Prefer Western/Persian thousand-sep removal; keep a single decimal point.
+    text = _THOUSAND_SEP.sub("", text)
+    if _CRM_DECIMAL.fullmatch(text):
+        return normalize_crm_decimal(text)
+    return text
+
+
+def _order_line_from_mapping(data: dict[str, str]) -> CustomerOrderLine | None:
+    qty_fields = ("note_quantity", "delivered_quantity", "remaining_quantity")
+    normalized = {
+        k: (normalize_order_quantity(v) if k in qty_fields else (v or "").strip())
+        for k, v in data.items()
+    }
+    line = CustomerOrderLine(
+        sales_office=normalized.get("sales_office", ""),
+        customer_name=normalized.get("customer_name", ""),
+        delivery_note_date=normalized.get("delivery_note_date", ""),
+        product_code=normalized.get("product_code", ""),
+        product_title=normalized.get("product_title", ""),
+        note_quantity=normalized.get("note_quantity", ""),
+        delivered_quantity=normalized.get("delivered_quantity", ""),
+        remaining_quantity=normalized.get("remaining_quantity", ""),
+        warehouse_delivery_date=normalized.get("warehouse_delivery_date", ""),
+        delivery_note_number=normalized.get("delivery_note_number", ""),
+        notes=normalized.get("notes", ""),
+    )
+    if not (
+        line.delivery_note_number
+        or line.product_code
+        or line.customer_name
+    ):
+        return None
+    return line
+
+
+def _parse_customer_orders_csv(text: str) -> list[CustomerOrderLine]:
+    reader = csv.reader(io.StringIO(text))
+    try:
+        header_row = next(reader)
+    except StopIteration as exc:
+        raise SystemGroupParseError("Customer orders CSV is empty.") from exc
+    header_map = [_normalize_order_header(h) for h in header_row]
+    if sum(1 for h in header_map if h) < 3:
+        raise SystemGroupParseError(
+            "Customer orders CSV headers not recognized. Expected columns like "
+            "شماره_حواله, کد_محصول1, مشتري, مانده."
+        )
+    lines: list[CustomerOrderLine] = []
+    for row in reader:
+        if not any((c or "").strip() for c in row):
+            continue
+        mapping: dict[str, str] = {}
+        for idx, field_name in enumerate(header_map):
+            if field_name and idx < len(row):
+                # First mapped column wins (tablix may repeat customer aggregates).
+                mapping.setdefault(field_name, row[idx])
+        entry = _order_line_from_mapping(mapping)
+        if entry:
+            lines.append(entry)
+    if not lines:
+        raise SystemGroupParseError("Customer orders CSV contained no usable rows.")
+    return lines
+
+
+def parse_customer_orders_document(
+    content: str, content_type: str | None = None
+) -> list[CustomerOrderLine]:
+    """Parse ReportViewer customer-orders export (CSV) into line rows."""
+    stripped = (content or "").strip()
+    if not stripped:
+        raise SystemGroupParseError("Empty customer orders document.")
+
+    ctype = (content_type or "").lower()
+    if "json" in ctype:
+        raise SystemGroupParseError(
+            "Customer orders JSON export is not supported; use CSV."
+        )
+    # XML export is hierarchical SSRS tablix; prefer CSV flatten.
+    if "xml" in ctype or stripped.lstrip().startswith("<"):
+        raise SystemGroupParseError(
+            "Customer orders XML export is not supported; use CSV (export_format='CSV')."
+        )
+    return _parse_customer_orders_csv(stripped)
 

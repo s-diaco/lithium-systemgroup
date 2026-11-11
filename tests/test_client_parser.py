@@ -19,15 +19,19 @@ from lithium_systemgroup import (
     bom_list_direct_url,
     bom_list_url,
     build_hashed_password,
+    customer_orders_report_url,
     deterministic_randbelow,
     digit_size_for_modulus,
     encrypted_string,
     extract_bom_id_from_url,
+    extract_export_url_base,
     list_revisions_for_part,
     match_bom_list_entries,
     normalize_crm_decimal,
+    normalize_order_quantity,
     parse_bom_document,
     parse_bom_list_document,
+    parse_customer_orders_document,
     parse_login_form,
     resolve_bom_from_list,
     split_bom_code,
@@ -253,6 +257,84 @@ class ClientTests(unittest.TestCase):
         body, ctype = client.fetch_bom(39477)
         self.assertIn("BomLinesGrid", body)
         self.assertIn("text/html", ctype)
+
+    def test_customer_orders_report_url_uses_base(self):
+        url = customer_orders_report_url("http://crm.example/", "ReportViewer.aspx?x=1")
+        self.assertTrue(url.startswith("http://crm.example/"))
+        self.assertIn("ReportViewer.aspx", url)
+
+    def test_extract_export_url_base(self):
+        html = (FIXTURES / "customer_orders_report.html").read_text(encoding="utf-8")
+        base = extract_export_url_base(html)
+        self.assertIsNotNone(base)
+        self.assertIn("ReportSession=fixtureSession001", base)
+        self.assertIn("OpType=Export", base)
+        self.assertTrue(base.endswith("Format="))
+
+    def test_fetch_customer_orders_csv_mock(self):
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        report_html = (FIXTURES / "customer_orders_report.html").read_text(
+            encoding="utf-8"
+        )
+        csv_text = (FIXTURES / "customer_orders.csv").read_text(encoding="utf-8")
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        report_get = mock.Mock(
+            status_code=200,
+            text=report_html,
+            url="http://crm/ReportViewer.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        report_get.raise_for_status = mock.Mock()
+        export_get = mock.Mock(
+            status_code=200,
+            content=csv_text.encode("utf-8-sig"),
+            text=csv_text,
+            url="http://crm/Reserved.ReportViewerWebControl.axd",
+            headers={"Content-Type": "text/csv; charset=utf-8"},
+        )
+        export_get.raise_for_status = mock.Mock()
+        session.get.side_effect = [login_get, report_get, export_get]
+        session.post.return_value = login_post
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        body, ctype = client.fetch_customer_orders()
+        self.assertIn("شماره_حواله", body)
+        self.assertIn("csv", ctype.lower())
+
+
+class CustomerOrdersParseTests(unittest.TestCase):
+    def test_normalize_order_quantity(self):
+        self.assertEqual(normalize_order_quantity("1,000"), "1000")
+        self.assertEqual(normalize_order_quantity("15,240"), "15240")
+        self.assertEqual(normalize_order_quantity("50"), "50")
+
+    def test_parse_csv_fixture(self):
+        raw = (FIXTURES / "customer_orders.csv").read_text(encoding="utf-8")
+        rows = parse_customer_orders_document(raw, content_type="text/csv")
+        self.assertEqual(len(rows), 3)
+        first = rows[0]
+        self.assertEqual(first.delivery_note_number, "00006607")
+        self.assertEqual(first.product_code, "RMJ/001")
+        self.assertEqual(first.remaining_quantity, "2")
+        self.assertIn("فخار", first.customer_name)
+        # Aggregate footer columns must not overwrite line quantities.
+        self.assertEqual(first.note_quantity, "50")
+        second = rows[1]
+        self.assertEqual(second.note_quantity, "1000")
+        self.assertEqual(second.remaining_quantity, "980")
+
+    def test_empty_orders_raise(self):
+        with self.assertRaises(SystemGroupParseError):
+            parse_customer_orders_document("   ")
 
 
 if __name__ == "__main__":
