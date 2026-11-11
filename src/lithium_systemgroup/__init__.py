@@ -1,4 +1,4 @@
-"""SystemGroup CRM client and BoM parsers for Python projects."""
+"""SystemGroup CRM client and BoM / customer-order parsers for Python projects."""
 
 from .catalog import (
     AmbiguousBomMatch,
@@ -16,18 +16,25 @@ from .client import (
     bom_list_direct_url,
     bom_list_url,
     credentials_from_env,
+    customer_orders_report_path_from_env,
+    customer_orders_report_url,
     extract_bom_id_from_url,
+    extract_export_url_base,
+    report_credentials_from_env,
 )
 from .parser import (
     BomLine,
     BomListEntry,
+    CustomerOrderLine,
     LoginFormFields,
     ParsedBom,
     SystemGroupParseError,
     match_bom_list_entries,
     normalize_crm_decimal,
+    normalize_order_quantity,
     parse_bom_document,
     parse_bom_list_document,
+    parse_customer_orders_document,
     parse_login_form,
     split_bom_code,
 )
@@ -44,6 +51,7 @@ __all__ = [
     "AmbiguousBomMatch",
     "BomLine",
     "BomListEntry",
+    "CustomerOrderLine",
     "LoginFormFields",
     "NoBomMatch",
     "ParsedBom",
@@ -58,20 +66,26 @@ __all__ = [
     "bom_list_url",
     "build_hashed_password",
     "credentials_from_env",
+    "customer_orders_report_path_from_env",
+    "customer_orders_report_url",
     "deterministic_randbelow",
     "digit_size_for_modulus",
     "encrypted_string",
     "extract_bom_id_from_url",
+    "extract_export_url_base",
     "list_revisions_for_part",
     "load_bom_list_entries",
     "match_bom_list_entries",
     "normalize_crm_decimal",
+    "normalize_order_quantity",
     "parse_bom_document",
     "parse_bom_list_document",
+    "parse_customer_orders_document",
     "parse_login_form",
+    "report_credentials_from_env",
     "resolve_bom_from_list",
     "split_bom_code",
     "unicode_correct_invalid_characters",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

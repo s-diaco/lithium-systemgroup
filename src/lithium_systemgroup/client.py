@@ -1,4 +1,4 @@
-"""ASP.NET forms-auth client for SystemGroup PAC Engineering BoM pages."""
+"""ASP.NET forms-auth client for SystemGroup PAC Engineering BoM and report pages."""
 
 from __future__ import annotations
 
@@ -20,6 +20,20 @@ DEFAULT_LOGIN_PATH = "/Authentication/Login.aspx"
 DEFAULT_BOM_EDIT_PAGE = "PAC/Engineering/BomPages/Edit.aspx"
 DEFAULT_BOM_LIST_PAGE = (
     "List.aspx?ComponentName=SystemGroup.PAC.Engineering&EntityName=Bom"
+)
+# Store report: sales delivery notes with remaining balance (path only; host from env).
+DEFAULT_CUSTOMER_ORDERS_REPORT_PATH = (
+    "ReportViewer.aspx?ShowParameterPanel=true&ReportPath="
+    "%2FCustomerReports%2FStore%2F"
+    "%DA%AF%D8%B2%D8%A7%D8%B1%D8%B4+%D8%AE%D9%84%D8%A7%D8%B5%D9%87+"
+    "%D8%AE%D8%B1%D9%88%D8%AC%DB%8C+%D9%87%D8%A7%DB%8C+"
+    "%D8%AD%D9%88%D8%A7%D9%84%D9%87+%D9%81%D8%B1%D9%88%D8%B4"
+    "%28%D8%A8%D8%A7+%D9%85%D8%A7%D9%86%D8%AF%D9%87+%29"
+)
+
+_EXPORT_URL_BASE = re.compile(
+    r'ExportUrlBase["\']?\s*:\s*["\']([^"\']+)["\']',
+    re.IGNORECASE,
 )
 
 _BOM_ID_IN_URL = re.compile(
@@ -51,29 +65,86 @@ def extract_bom_id_from_url(url: str) -> str | None:
     return None
 
 
+def _normalize_base_url(base: str) -> str:
+    base = (base or "").strip()
+    if base and not base.endswith("/"):
+        base += "/"
+    return base
+
+
 def credentials_from_env() -> tuple[str, str, str]:
-    """Return (base_url, username, password) from CRM_* env vars."""
-    base = (os.environ.get("CRM_BASE_URL") or "").strip()
-    user = (os.environ.get("CRM_USERNAME") or "").strip()
-    password = os.environ.get("CRM_PASSWORD") or ""
-    missing = [
-        name
-        for name, val in (
-            ("CRM_BASE_URL", base),
-            ("CRM_USERNAME", user),
-            ("CRM_PASSWORD", password),
-        )
-        if not val
-    ]
+    """Return (base_url, username, password) from CRM_* env vars.
+
+    Falls back to REPORT_* when CRM_* is unset (same host/credentials overlap).
+    """
+    base = (os.environ.get("CRM_BASE_URL") or os.environ.get("REPORT_BASE_URL") or "").strip()
+    user = (os.environ.get("CRM_USERNAME") or os.environ.get("REPORT_USERNAME") or "").strip()
+    password = os.environ.get("CRM_PASSWORD") or os.environ.get("REPORT_PASSWORD") or ""
+    missing = []
+    if not base:
+        missing.append("CRM_BASE_URL (or REPORT_BASE_URL)")
+    if not user:
+        missing.append("CRM_USERNAME (or REPORT_USERNAME)")
+    if not password:
+        missing.append("CRM_PASSWORD (or REPORT_PASSWORD)")
     if missing:
         raise SystemGroupClientError(
             "Missing required env vars: "
             + ", ".join(missing)
             + ". Set them in the environment or a gitignored env file; never commit secrets."
         )
-    if not base.endswith("/"):
-        base += "/"
-    return base, user, password
+    return _normalize_base_url(base), user, password
+
+
+def report_credentials_from_env() -> tuple[str, str, str]:
+    """Return (base_url, username, password) from REPORT_* env vars.
+
+    Falls back to CRM_* when REPORT_* is unset.
+    """
+    base = (os.environ.get("REPORT_BASE_URL") or os.environ.get("CRM_BASE_URL") or "").strip()
+    user = (os.environ.get("REPORT_USERNAME") or os.environ.get("CRM_USERNAME") or "").strip()
+    password = os.environ.get("REPORT_PASSWORD") or os.environ.get("CRM_PASSWORD") or ""
+    missing = []
+    if not base:
+        missing.append("REPORT_BASE_URL (or CRM_BASE_URL)")
+    if not user:
+        missing.append("REPORT_USERNAME (or CRM_USERNAME)")
+    if not password:
+        missing.append("REPORT_PASSWORD (or CRM_PASSWORD)")
+    if missing:
+        raise SystemGroupClientError(
+            "Missing required env vars: "
+            + ", ".join(missing)
+            + ". Set them in the environment or a gitignored env file; never commit secrets."
+        )
+    return _normalize_base_url(base), user, password
+
+
+def customer_orders_report_path_from_env() -> str:
+    """Report page path (no host) from REPORT_ORDERS_PATH, else package default."""
+    path = (os.environ.get("REPORT_ORDERS_PATH") or "").strip()
+    return path.lstrip("/") if path else DEFAULT_CUSTOMER_ORDERS_REPORT_PATH
+
+
+def customer_orders_report_url(
+    base_url: str, report_path: str | None = None
+) -> str:
+    """Build absolute ReportViewer URL under base_url."""
+    path = (report_path or customer_orders_report_path_from_env()).lstrip("/")
+    return urljoin(_normalize_base_url(base_url), path)
+
+
+def extract_export_url_base(html: str) -> str | None:
+    """Pull ReportViewer ``ExportUrlBase`` (ends before Format= value)."""
+    match = _EXPORT_URL_BASE.search(html or "")
+    if not match:
+        return None
+    # JS string may contain \\u0026 for &
+    raw = match.group(1)
+    try:
+        return raw.encode("utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        return raw.replace("\\u0026", "&").replace("\\/", "/")
 
 
 def bom_edit_url(base_url: str, bom_id: str | int) -> str:
@@ -108,15 +179,16 @@ class SystemGroupClient:
         password: str | None = None,
         session: requests.Session | None = None,
         timeout: float = 60.0,
+        *,
+        prefer_report_env: bool = False,
     ) -> None:
         if base_url is None or username is None or password is None:
-            env_base, env_user, env_pass = credentials_from_env()
+            loader = report_credentials_from_env if prefer_report_env else credentials_from_env
+            env_base, env_user, env_pass = loader()
             base_url = base_url or env_base
             username = username or env_user
             password = password if password is not None else env_pass
-        if not base_url.endswith("/"):
-            base_url += "/"
-        self.base_url = base_url
+        self.base_url = _normalize_base_url(base_url or "")
         self.username = username
         self.password = password
         self.timeout = timeout
@@ -296,6 +368,69 @@ class SystemGroupClient:
             "BoM list page",
             prefer_predicate=_looks_like_list,
         )
+
+    def fetch_customer_orders_report(
+        self, report_path: str | None = None
+    ) -> tuple[str, str]:
+        """GET the customer-orders ReportViewer page; return (html, content_type)."""
+        if not self._logged_in:
+            self.login()
+        url = customer_orders_report_url(self.base_url, report_path)
+        try:
+            resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            raise SystemGroupClientError(
+                f"Could not fetch customer orders report ({url.split('?', 1)[0]}): {exc}"
+            ) from exc
+        if "login.aspx" in (resp.url or "").lower():
+            raise SystemGroupClientError(
+                "Customer orders report redirected to login; check credentials."
+            )
+        return resp.text, resp.headers.get("Content-Type", "text/html")
+
+    def fetch_customer_orders(
+        self,
+        report_path: str | None = None,
+        *,
+        export_format: str = "CSV",
+    ) -> tuple[str, str]:
+        """Open the store orders report and download an export (default CSV).
+
+        ReportViewer keeps a ``ReportSession`` on first GET; exports use
+        ``ExportUrlBase`` + format (CSV / XML / EXCELOPENXML). Shell chrome is
+        not required — same preference as direct BoM pages.
+        """
+        if not self._logged_in:
+            self.login()
+        html, _ctype = self.fetch_customer_orders_report(report_path)
+        export_base = extract_export_url_base(html)
+        if not export_base:
+            raise SystemGroupClientError(
+                "Customer orders report HTML had no ExportUrlBase. "
+                "Save ReportViewer HTML and update extract_export_url_base()."
+            )
+        fmt = (export_format or "CSV").strip().upper() or "CSV"
+        export_url = urljoin(self.base_url, export_base.lstrip("/") + fmt)
+        try:
+            resp = self.session.get(
+                export_url, timeout=self.timeout, allow_redirects=True
+            )
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            raise SystemGroupClientError(
+                f"Could not export customer orders ({fmt}): {exc}"
+            ) from exc
+        if "login.aspx" in (resp.url or "").lower():
+            raise SystemGroupClientError(
+                "Customer orders export redirected to login; check credentials."
+            )
+        # Decode text exports with BOM; leave binary callers to use content bytes via raw session.
+        ctype = resp.headers.get("Content-Type", "application/octet-stream")
+        if "csv" in ctype.lower() or fmt == "CSV" or "xml" in ctype.lower() or fmt == "XML":
+            text = resp.content.decode("utf-8-sig")
+            return text, ctype
+        return resp.text, ctype
 
 
 def rewrite_url_host(url: str, base_url: str) -> str:
