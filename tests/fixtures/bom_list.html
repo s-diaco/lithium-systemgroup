@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head><title>BoM List — FIXTURE</title></head>
+<body>
+<!--
+  FIXTURE: CRM BoM list. Column «کد BOM» holds parent_part_number/revision
+  (e.g. 500-9001-00/1). Diaco: replace with a saved authenticated List.aspx
+  HTML (EntityName=Bom) to lock production markup.
+-->
+<table id="BomListGrid" class="bom-list entity-list">
+  <tr>
+    <th>Id</th>
+    <th>کد BOM</th>
+    <th>Description</th>
+    <th></th>
+  </tr>
+  <tr data-bom-id="39477">
+    <td>39477</td>
+    <td>500-9001-00/1</td>
+    <td>Fixture assembly from SystemGroup</td>
+    <td><a href="Shell.aspx?page=PAC/Engineering/BomPages/Edit.aspx?id=39477">Edit</a></td>
+  </tr>
+  <tr data-bom-id="40001">
+    <td>40001</td>
+    <td>500-9001-00/A</td>
+    <td>Duplicate PN older revision BoM</td>
+    <td><a href="/PAC/Engineering/BomPages/Edit.aspx?id=40001">Edit</a></td>
+  </tr>
+  <tr data-bom-id="41000">
+    <td>41000</td>
+    <td>500-1111-00/1</td>
+    <td>Other assembly</td>
+    <td><a href="Shell.aspx?page=PAC/Engineering/BomPages/Edit.aspx?id=41000">Edit</a></td>
+  </tr>
+  <tr data-bom-id="42000">
+    <td>42000</td>
+    <td>600-2222-00/2</td>
+    <td>Unique description match target</td>
+    <td><a href="Shell.aspx?page=PAC/Engineering/BomPages/Edit.aspx?id=42000">Edit</a></td>
+  </tr>
+</table>
+</body>
+</html>

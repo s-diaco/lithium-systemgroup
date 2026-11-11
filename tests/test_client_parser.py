@@ -1,0 +1,259 @@
+"""Django-free tests for lithium_systemgroup (fixtures under tests/fixtures)."""
+
+from __future__ import annotations
+
+import re
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from lithium_systemgroup import (
+    AmbiguousBomMatch,
+    NoBomMatch,
+    SystemGroupClient,
+    SystemGroupClientError,
+    SystemGroupParseError,
+    bi_to_hex,
+    bom_edit_direct_url,
+    bom_edit_url,
+    bom_list_direct_url,
+    bom_list_url,
+    build_hashed_password,
+    deterministic_randbelow,
+    digit_size_for_modulus,
+    encrypted_string,
+    extract_bom_id_from_url,
+    list_revisions_for_part,
+    match_bom_list_entries,
+    normalize_crm_decimal,
+    parse_bom_document,
+    parse_bom_list_document,
+    parse_login_form,
+    resolve_bom_from_list,
+    split_bom_code,
+    unicode_correct_invalid_characters,
+)
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+class LoginParseTests(unittest.TestCase):
+    def test_parse_login_form_extracts_aspnet_fields(self):
+        html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        form = parse_login_form(html)
+        self.assertEqual(form.username_name, "txtUsername")
+        self.assertEqual(form.password_name, "txtPassword")
+        self.assertIn("__VIEWSTATE", form.hidden)
+        self.assertTrue(form.uses_rsa_password)
+        self.assertEqual(form.rsa_exponent_hex, "010001")
+        self.assertEqual(form.session_id, "fixture-session-001")
+
+    def test_parse_login_form_missing_password_raises(self):
+        with self.assertRaises(SystemGroupParseError):
+            parse_login_form("<html><form><input name='u' type='text'></form></html>")
+
+
+class RsaLoginTests(unittest.TestCase):
+    _N_HEX = (
+        "cc175d0a4536caa7ce8b05bb30b8b2da836d9fc82e7bfbd31daadbbbb816b40bcc8fac18"
+        "4dbdd85c6ccd763a0c3df10b77a8d6fb54507d13a62b1ddc68420f8d1929551c03485646"
+        "bddb24010d37eb92b8280c74eee3e1ad2b1bfb12a4df8733cc6590829619a3ae76ea76ed"
+        "627084a6642d91141008b7336fbb59abcb9ccf65"
+    )
+    _D_HEX = (
+        "8848b5ad6d08a88d23e43be0832962ed7dc40f658a7cea6d50ab4e6ded00e41bd8eebbb9"
+        "c2f819e9a6121177b3c30d1a5e3e55c8a0c5daafeb4f717244009106b2a7d09fe23625af"
+        "55661274814b25cc25d245fb658bf6720cbef7480b3df8b832e23f4bd594ceaee8e4a0d1"
+        "84f0d4dc51a25a28a10f9229e953ea1711e34621"
+    )
+    _E_HEX = "010001"
+
+    def test_unicode_correct_arabic_yeh_keh(self):
+        self.assertEqual(
+            unicode_correct_invalid_characters("\u064a\u0643"),
+            "\u06cc\u06a9",
+        )
+
+    def test_encrypted_string_roundtrip_pkcs1(self):
+        plaintext = "fixture-session-001--s3cret"
+        ct_hex = encrypted_string(
+            plaintext,
+            exponent_hex=self._E_HEX,
+            modulus_hex=self._N_HEX,
+            randbelow=deterministic_randbelow(42),
+        )
+        c_int = int(ct_hex.split()[0], 16)
+        n = int(self._N_HEX, 16)
+        d = int(self._D_HEX, 16)
+        em = pow(c_int, d, n).to_bytes(digit_size_for_modulus(n), "big")
+        sep = em.index(0x00, 2)
+        self.assertEqual(em[sep + 1 :].decode("utf-8"), plaintext)
+
+    def test_build_hashed_password_uses_session_separator(self):
+        ct = build_hashed_password(
+            "pw",
+            session_id="SID",
+            exponent_hex=self._E_HEX,
+            modulus_hex=self._N_HEX,
+            randbelow=deterministic_randbelow(7),
+        )
+        c_int = int(ct.split()[0], 16)
+        n = int(self._N_HEX, 16)
+        d = int(self._D_HEX, 16)
+        em = pow(c_int, d, n).to_bytes(digit_size_for_modulus(n), "big")
+        sep = em.index(0x00, 2)
+        self.assertEqual(em[sep + 1 :].decode("utf-8"), "SID--pw")
+
+    def test_bi_to_hex_groups(self):
+        self.assertEqual(bi_to_hex(0), "0000")
+        self.assertEqual(bi_to_hex(0xABCD), "abcd")
+
+
+class BomParseTests(unittest.TestCase):
+    def test_parse_html_fixture(self):
+        html = (FIXTURES / "bom_edit.html").read_text(encoding="utf-8")
+        bom = parse_bom_document(html, content_type="text/html")
+        self.assertEqual(bom.bom_id, "39477")
+        self.assertEqual(bom.parent_part_number, "500-9001-00")
+        self.assertEqual(len(bom.lines), 3)
+        self.assertEqual(bom.lines[0].part_number, "200-3333-00")
+
+    def test_parse_json_fixture(self):
+        raw = (FIXTURES / "bom_edit.json").read_text(encoding="utf-8")
+        bom = parse_bom_document(raw, content_type="application/json")
+        self.assertEqual(bom.bom_id, "39477")
+        self.assertEqual(len(bom.lines), 2)
+
+    def test_parse_telerik_edit_html_eds_materials(self):
+        html = (FIXTURES / "bom_edit_telerik.html").read_text(encoding="utf-8")
+        bom = parse_bom_document(html, content_type="text/html")
+        self.assertEqual(bom.source, "html-eds-materials")
+        self.assertEqual(bom.parent_part_number, "1155F229")
+        self.assertEqual(bom.parent_revision, "A2*10-C")
+        self.assertEqual(len(bom.lines), 3)
+
+    def test_normalize_crm_decimal(self):
+        self.assertEqual(normalize_crm_decimal("70/000000000000000"), "70")
+        self.assertEqual(normalize_crm_decimal("10/500"), "10.5")
+
+    def test_empty_document_raises(self):
+        with self.assertRaises(SystemGroupParseError):
+            parse_bom_document("   ")
+
+
+class BomListParseTests(unittest.TestCase):
+    def test_split_bom_code(self):
+        self.assertEqual(split_bom_code("1155F229/A2*10-C"), ("1155F229", "A2*10-C"))
+        self.assertEqual(split_bom_code("CGM5883"), ("CGM5883", ""))
+
+    def test_parse_list_html_fixture(self):
+        html = (FIXTURES / "bom_list.html").read_text(encoding="utf-8")
+        entries = parse_bom_list_document(html, content_type="text/html")
+        self.assertEqual(len(entries), 4)
+        self.assertEqual(entries[0].bom_id, "39477")
+
+    def test_parse_telerik_list_json_fixture(self):
+        raw = (FIXTURES / "bom_list_telerik.json").read_text(encoding="utf-8")
+        entries = parse_bom_list_document(raw, content_type="application/json")
+        self.assertEqual(entries[0].part_number, "1155F229")
+        self.assertEqual(entries[0].revision, "A2*10-C")
+
+    def test_match_narrows_ambiguous_pn_with_revision(self):
+        entries = parse_bom_list_document(
+            (FIXTURES / "bom_list.html").read_text(encoding="utf-8")
+        )
+        hits = match_bom_list_entries(
+            entries, part_number="500-9001-00", revision="1"
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].bom_id, "39477")
+
+    def test_resolve_no_match(self):
+        with self.assertRaises(NoBomMatch):
+            resolve_bom_from_list(
+                part_number="999-0000-00",
+                list_path=FIXTURES / "bom_list.json",
+            )
+
+    def test_resolve_ambiguous(self):
+        with self.assertRaises(AmbiguousBomMatch) as ctx:
+            resolve_bom_from_list(
+                part_number="500-9001-00",
+                list_path=FIXTURES / "bom_list.html",
+            )
+        self.assertEqual(len(ctx.exception.matches), 2)
+
+    def test_list_revisions_for_part(self):
+        rows = list_revisions_for_part(
+            "500-9001-00", list_path=FIXTURES / "bom_list.json"
+        )
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertEqual({r.part_number for r in rows}, {"500-9001-00"})
+
+
+class ClientTests(unittest.TestCase):
+    def test_build_login_payload(self):
+        html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        form = parse_login_form(html)
+        client = SystemGroupClient(
+            base_url="http://192.168.3.193/",
+            username="alice",
+            password="secret",
+        )
+        payload = client.build_login_payload(form)
+        self.assertEqual(payload["txtUsername"], "alice")
+        self.assertEqual(payload["txtPassword"], "")
+        self.assertTrue(payload["hashedPassword"])
+        self.assertRegex(payload["hashedPassword"], r"^[0-9a-f]+( [0-9a-f]+)*$")
+
+    def test_urls(self):
+        self.assertIn("Shell.aspx", bom_edit_url("http://crm/", 39477))
+        self.assertIn("id=39477", bom_edit_direct_url("http://crm/", 39477))
+        self.assertIn("EntityName=Bom", bom_list_direct_url("http://crm/"))
+        self.assertIn("Shell.aspx", bom_list_url("http://crm/"))
+
+    def test_extract_bom_id_from_url(self):
+        self.assertEqual(
+            extract_bom_id_from_url(
+                "http://crm/Shell.aspx?page=PAC/Engineering/BomPages/Edit.aspx?id=39477"
+            ),
+            "39477",
+        )
+        self.assertIsNone(extract_bom_id_from_url("http://example/no-id"))
+
+    def test_credentials_from_env_missing(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(SystemGroupClientError):
+                SystemGroupClient()
+
+    def test_login_and_fetch_bom_with_session_mock(self):
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        bom_html = (FIXTURES / "bom_edit.html").read_text(encoding="utf-8")
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        bom_get = mock.Mock(
+            status_code=200,
+            text=bom_html,
+            url="http://crm/Edit.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        bom_get.raise_for_status = mock.Mock()
+        session.get.side_effect = [login_get, bom_get]
+        session.post.return_value = login_post
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        body, ctype = client.fetch_bom(39477)
+        self.assertIn("BomLinesGrid", body)
+        self.assertIn("text/html", ctype)
+
+
+if __name__ == "__main__":
+    unittest.main()

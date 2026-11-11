@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head><title>SystemGroup Login — FIXTURE</title></head>
+<body>
+<!--
+  FIXTURE: mirrors real Authentication/Login.aspx field names (LAN sample).
+  RSA hashedPassword flow from Login.js beforeLogin + RSA.js encryptedString.
+  Diaco: refresh from a saved Login.aspx if field names change.
+-->
+<form method="post" action="./Login.aspx" id="container" onsubmit="beforeLogin()">
+  <input type="hidden" name="uid" id="uid" value="fixture-uid" />
+  <input type="hidden" name="redirect_endpoint" value="" />
+  <input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="/wEPDwUKLTFixtureViewState" />
+  <input type="hidden" name="__VIEWSTATEGENERATOR" id="__VIEWSTATEGENERATOR" value="FIXTURE1" />
+  <input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="/wEWAgFixtureEventValidation" />
+  <label for="txtUsername">User name</label>
+  <input name="txtUsername" type="text" id="txtUsername" />
+  <label for="txtPassword">Password</label>
+  <input name="txtPassword" type="password" id="txtPassword" />
+  <input type="submit" name="btnSubmit" value="Log in" id="btnSubmit" />
+  <input type="submit" name="btnHidSubmit" value="" id="btnHidSubmit" style="display:none" />
+  <input name="rsa_e" type="hidden" id="rsa_e" value="010001" />
+  <input name="rsa_m" type="hidden" id="rsa_m" value="CA5E3B8199482D2E87A36AF7F3934BFCA64035AF217C9801ED83B3332D74A88C7548D7ADA9575B62FB84085FAE387289C7C1C3D470BDD5971665C07DC39C23212844B9F6F92F5E3711E44F978CFF9A941A962AB31D606F09E3CA46314602C5203534D7C6E3618A1D00C876E89751E1C228FE242842294E5A4D63AB66E3F430B1" />
+  <input name="sessionid" type="hidden" id="sessionid" value="fixture-session-001" />
+  <input name="hashedPassword" type="hidden" id="hashedPassword" />
+  <input name="errorMessage" type="hidden" id="errorMessage" value="" />
+</form>
+</body>
+</html>

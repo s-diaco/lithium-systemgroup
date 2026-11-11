@@ -1,0 +1,28 @@
+{
+  "rows": [
+    {
+      "id": "39477",
+      "کد BOM": "500-9001-00/1",
+      "description": "Fixture assembly from SystemGroup",
+      "edit_url": "Shell.aspx?page=PAC/Engineering/BomPages/Edit.aspx?id=39477"
+    },
+    {
+      "id": "40001",
+      "bom_code": "500-9001-00/A",
+      "description": "Duplicate PN older revision BoM",
+      "edit_url": "/PAC/Engineering/BomPages/Edit.aspx?id=40001"
+    },
+    {
+      "id": "41000",
+      "bom_code": "500-1111-00/1",
+      "description": "Other assembly",
+      "edit_url": "Shell.aspx?page=PAC/Engineering/BomPages/Edit.aspx?id=41000"
+    },
+    {
+      "id": "42000",
+      "bom_code": "600-2222-00/2",
+      "description": "Unique description match target",
+      "edit_url": "Shell.aspx?page=PAC/Engineering/BomPages/Edit.aspx?id=42000"
+    }
+  ]
+}

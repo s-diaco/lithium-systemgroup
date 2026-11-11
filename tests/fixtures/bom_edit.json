@@ -1,0 +1,26 @@
+{
+  "bom_id": "39477",
+  "parent": {
+    "part_number": "500-9001-00",
+    "revision": "1",
+    "description": "Fixture assembly from SystemGroup JSON"
+  },
+  "lines": [
+    {
+      "part_number": "200-3333-00",
+      "quantity": 2,
+      "revision": "1",
+      "description": "Existing child part",
+      "reference": "U1, U2"
+    },
+    {
+      "part_number": "500-7777-00",
+      "quantity": 1,
+      "revision": "1",
+      "description": "Brand new child from CRM",
+      "reference": "J1",
+      "manufacturer": "Acme",
+      "mpn": "ACM-7777"
+    }
+  ]
+}
