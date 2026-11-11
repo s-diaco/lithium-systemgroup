@@ -1,8 +1,8 @@
 # lithium-systemgroup
 
-SystemGroup CRM client and BoM parsers for **Lithium** and other Python projects.
+SystemGroup CRM client and BoM parsers for Python projects.
 
-Talks to the on-LAN SystemGroup PAC Engineering CRM (forms-auth login, BoM list, BoM edit pages) and returns structured data. **No Django / Lithium models.**
+Talks to the on-LAN SystemGroup PAC Engineering CRM (forms-auth login, BoM list, BoM edit pages) and returns structured data. Framework-agnostic; no ORM or app models.
 
 ## Install
 
@@ -53,7 +53,7 @@ CLI-style env credentials (optional): `CRM_BASE_URL`, `CRM_USERNAME`, `CRM_PASSW
 
 ## What it does **not** include
 
-Writing into Lithium (parts, revisions, assemblies). That stays in `django-bom` / Lithium.
+Writing parts, revisions, or assemblies into a downstream BoM / ERP app. That stays in the consuming application.
 
 ## Development
 
@@ -67,4 +67,4 @@ Fixtures under `tests/fixtures/` are trimmed CRM samples (LAN-only host).
 
 ## License
 
-GPL-3.0-or-later (same family as django-bom / Lithium).
+GPL-3.0-or-later.

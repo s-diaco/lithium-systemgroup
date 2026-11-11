@@ -1,4 +1,4 @@
-"""BoM list loading and match helpers (CRM only; no Lithium models)."""
+"""BoM list loading and match helpers (CRM only; no app models)."""
 
 from __future__ import annotations
 

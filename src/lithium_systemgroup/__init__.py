@@ -1,4 +1,4 @@
-"""SystemGroup CRM client and BoM parsers for Lithium and other Python projects."""
+"""SystemGroup CRM client and BoM parsers for Python projects."""
 
 from .catalog import (
     AmbiguousBomMatch,
