@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
+from html import unescape
+from typing import Iterator
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
@@ -21,6 +24,8 @@ DEFAULT_BOM_EDIT_PAGE = "PAC/Engineering/BomPages/Edit.aspx"
 DEFAULT_BOM_LIST_PAGE = (
     "List.aspx?ComponentName=SystemGroup.PAC.Engineering&EntityName=Bom"
 )
+# SgGridView EntityListPaging defaults to 50 rows; CRM list often spans many pages.
+DEFAULT_BOM_LIST_MAX_PAGES = 500
 # Store report: sales delivery notes with remaining balance (path only; host from env).
 DEFAULT_CUSTOMER_ORDERS_REPORT_PATH = (
     "ReportViewer.aspx?ShowParameterPanel=true&ReportPath="
@@ -40,6 +45,129 @@ _BOM_ID_IN_URL = re.compile(
     r"(?:[?&]id=|/id/)(\d+)",
     re.IGNORECASE,
 )
+
+_HIDDEN_INPUT = re.compile(
+    r"<input\b[^>]*\btype\s*=\s*[\"']hidden[\"'][^>]*>",
+    re.IGNORECASE,
+)
+_INPUT_NAME = re.compile(r"\bname\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
+_INPUT_VALUE = re.compile(r"\bvalue\s*=\s*[\"']([^\"']*)[\"']", re.IGNORECASE)
+_FORM_ACTION = re.compile(
+    r"<form\b[^>]*\baction\s*=\s*[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
+# EntityListPaging toolbar: PostBackOptions('…Pager', '{0}', …) — not the page combo.
+# Live CRM scripts often emit quotes as \u0027 inside $create JSON blobs.
+_PAGER_POSTBACK_TARGET = re.compile(
+    r"WebForm_PostBackOptions\(\s*(?:\\u0027|[\"'])"
+    r"([^\"'\\]+Pager)"
+    r"(?:\\u0027|[\"'])\s*,\s*(?:\\u0027|[\"'])\{0\}(?:\\u0027|[\"'])",
+    re.IGNORECASE,
+)
+_PAGE_LABEL = re.compile(r"صفحه\s*(\d+)", re.IGNORECASE)
+_CBO_PAGE_VALUE = re.compile(
+    r'id="[^"]*cboPage_Input"[^>]*\bvalue="([^"]*)"',
+    re.IGNORECASE,
+)
+_CBO_PAGE_VALUE_ALT = re.compile(
+    r'\bname="[^"]*cboPage"[^>]*\bvalue="([^"]*)"',
+    re.IGNORECASE,
+)
+_PAGE_DROPDOWN_ITEM = re.compile(
+    r'<li\b[^>]*class="[^"]*rcbItem[^"]*"[^>]*>\s*(صفحه\s*\d+)\s*</li>',
+    re.IGNORECASE,
+)
+_NEXT_BUTTON = re.compile(
+    r'<li\b([^>]*)>\s*<a\b[^>]*title="بعدی"',
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class BomListPager:
+    """Pagination controls from a CRM BoM list (SgGridView EntityListPaging)."""
+
+    action: str
+    fields: dict[str, str]
+    pager_target: str | None
+    current_page: int
+    page_count: int
+    next_enabled: bool
+
+
+def extract_aspnet_form_fields(html: str) -> tuple[str, dict[str, str]]:
+    """Return (form action, hidden input map) from the first ASP.NET form."""
+    action_match = _FORM_ACTION.search(html or "")
+    action = unescape(action_match.group(1)) if action_match else ""
+    fields: dict[str, str] = {}
+    for tag in _HIDDEN_INPUT.findall(html or ""):
+        name_match = _INPUT_NAME.search(tag)
+        if not name_match:
+            continue
+        value_match = _INPUT_VALUE.search(tag)
+        fields[name_match.group(1)] = (
+            unescape(value_match.group(1)) if value_match else ""
+        )
+    return action, fields
+
+
+def parse_bom_list_pager(html: str) -> BomListPager | None:
+    """Parse EntityListPaging state from BoM list HTML, or None if absent."""
+    if not html:
+        return None
+    has_pager_chrome = (
+        "EntityListPaging" in html
+        or "cboPage" in html
+        or _PAGER_POSTBACK_TARGET.search(html) is not None
+    )
+    if not has_pager_chrome:
+        return None
+
+    action, fields = extract_aspnet_form_fields(html)
+    pager_target: str | None = None
+    for match in _PAGER_POSTBACK_TARGET.finditer(html):
+        target = match.group(1)
+        if "cboPage" in target:
+            continue
+        pager_target = target
+        break
+
+    page_numbers = [
+        int(m.group(1))
+        for m in _PAGE_LABEL.finditer(" ".join(_PAGE_DROPDOWN_ITEM.findall(html)))
+    ]
+    if not page_numbers:
+        # Fallback: any صفحهN labels (combo input + dropdown).
+        page_numbers = [int(m.group(1)) for m in _PAGE_LABEL.finditer(html)]
+    page_count = max(page_numbers) if page_numbers else 1
+
+    current_raw = ""
+    for pattern in (_CBO_PAGE_VALUE, _CBO_PAGE_VALUE_ALT):
+        match = pattern.search(html)
+        if match:
+            current_raw = match.group(1)
+            break
+    current_match = _PAGE_LABEL.search(current_raw) if current_raw else None
+    current_page = int(current_match.group(1)) if current_match else 1
+
+    next_enabled = False
+    next_match = _NEXT_BUTTON.search(html)
+    if next_match:
+        next_enabled = "rtbDisabled" not in (next_match.group(1) or "")
+    elif pager_target and current_page < page_count:
+        next_enabled = True
+
+    if not pager_target and page_count <= 1:
+        return None
+
+    return BomListPager(
+        action=action,
+        fields=fields,
+        pager_target=pager_target,
+        current_page=current_page,
+        page_count=max(page_count, current_page, 1),
+        next_enabled=next_enabled,
+    )
 
 
 def extract_bom_id_from_url(url: str) -> str | None:
@@ -346,10 +474,12 @@ class SystemGroupClient:
         )
 
     def fetch_bom_list(self) -> tuple[str, str]:
-        """Return (body_text, content_type) for the BoM list page.
+        """Return (body_text, content_type) for the first BoM list page.
 
         Prefers direct List.aspx (has SgGridView/Telerik rows). Shell.aspx is
         chrome-only on this CRM and yields no ``rgRow`` grid.
+
+        For the full catalog (every pager page), use ``iter_bom_list_pages``.
         """
         if not self._logged_in:
             self.login()
@@ -368,6 +498,71 @@ class SystemGroupClient:
             "BoM list page",
             prefer_predicate=_looks_like_list,
         )
+
+    def _bom_list_post_url(self, action: str) -> str:
+        """Resolve list form action against the CRM base URL."""
+        if not action:
+            return bom_list_direct_url(self.base_url)
+        return urljoin(self.base_url, action.lstrip("./"))
+
+    def _post_bom_list_next(
+        self, html: str, pager: BomListPager
+    ) -> tuple[str, str]:
+        """POST EntityListPaging ``Next`` and return (body, content_type)."""
+        if not pager.pager_target:
+            raise SystemGroupClientError(
+                "BoM list pager has no postback target for Next."
+            )
+        payload = dict(pager.fields)
+        payload["__EVENTTARGET"] = pager.pager_target
+        payload["__EVENTARGUMENT"] = "Next"
+        url = self._bom_list_post_url(pager.action)
+        try:
+            resp = self.session.post(
+                url, data=payload, timeout=self.timeout, allow_redirects=True
+            )
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            raise SystemGroupClientError(
+                f"Could not fetch next BoM list page ({url.split('?', 1)[0]}): {exc}"
+            ) from exc
+        if "login.aspx" in (resp.url or "").lower():
+            raise SystemGroupClientError(
+                "BoM list page postback redirected to login; check credentials."
+            )
+        return resp.text, resp.headers.get("Content-Type", "text/html")
+
+    def iter_bom_list_pages(
+        self, *, max_pages: int | None = None
+    ) -> Iterator[tuple[str, str]]:
+        """Yield (body, content_type) for every EntityListPaging page.
+
+        Starts with a GET of the first page, then ASP.NET postbacks with
+        ``__EVENTARGUMENT=Next`` on the SgToolBar pager until Next is
+        disabled, the page index stops advancing, or ``max_pages`` is hit.
+        """
+        if not self._logged_in:
+            self.login()
+        limit = DEFAULT_BOM_LIST_MAX_PAGES if max_pages is None else max(1, max_pages)
+        body, ctype = self.fetch_bom_list()
+        yield body, ctype
+
+        seen_pages: set[int] = set()
+        for _ in range(limit - 1):
+            pager = parse_bom_list_pager(body)
+            if pager is None or not pager.next_enabled or not pager.pager_target:
+                break
+            if pager.current_page in seen_pages:
+                break
+            seen_pages.add(pager.current_page)
+            if pager.current_page >= pager.page_count:
+                break
+            body, ctype = self._post_bom_list_next(body, pager)
+            next_pager = parse_bom_list_pager(body)
+            if next_pager is not None and next_pager.current_page == pager.current_page:
+                # Postback did not advance — stop to avoid an infinite loop.
+                break
+            yield body, ctype
 
     def fetch_customer_orders_report(
         self, report_path: str | None = None

@@ -66,8 +66,20 @@ def load_bom_list_entries(
             )
             return parse_bom_list_document(content, content_type=ctype)
         sg = client or SystemGroupClient()
-        body, ctype = sg.fetch_bom_list()
-        return parse_bom_list_document(body, content_type=ctype)
+        # Walk every EntityListPaging page (CRM defaults to 50 rows/page).
+        merged: list[BomListEntry] = []
+        seen: set[str] = set()
+        for body, ctype in sg.iter_bom_list_pages():
+            for entry in parse_bom_list_document(body, content_type=ctype):
+                if entry.bom_id in seen:
+                    continue
+                seen.add(entry.bom_id)
+                merged.append(entry)
+        if not merged:
+            raise SystemGroupParseError(
+                "No BoM list rows found across paginated list pages."
+            )
+        return merged
     except (SystemGroupClientError, SystemGroupParseError, OSError) as exc:
         raise SystemGroupError(str(exc)) from exc
 
