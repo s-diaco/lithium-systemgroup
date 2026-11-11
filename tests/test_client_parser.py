@@ -1,4 +1,4 @@
-"""Django-free tests for lithium_systemgroup (fixtures under tests/fixtures)."""
+"""Standalone tests for this package (fixtures under tests/fixtures)."""
 
 from __future__ import annotations
 
