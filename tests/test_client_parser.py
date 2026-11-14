@@ -190,11 +190,26 @@ class BomListParseTests(unittest.TestCase):
         self.assertEqual(len(ctx.exception.matches), 2)
 
     def test_list_revisions_for_part(self):
-        rows = list_revisions_for_part(
+        result = list_revisions_for_part(
             "500-9001-00", list_path=FIXTURES / "bom_list.json"
         )
-        self.assertGreaterEqual(len(rows), 2)
-        self.assertEqual({r.part_number for r in rows}, {"500-9001-00"})
+        self.assertGreaterEqual(len(result.entries), 2)
+        self.assertEqual({r.part_number for r in result.entries}, {"500-9001-00"})
+        self.assertFalse(result.truncated)
+
+    def test_list_revisions_startswith_prefix_and_cap(self):
+        """Slash prefixes match Number StartsWith; cap sets truncated."""
+        html = (FIXTURES / "bom_list.html").read_text(encoding="utf-8")
+        full = list_revisions_for_part("500-9001-00/1", list_html=html)
+        self.assertEqual([e.bom_id for e in full.entries], ["39477"])
+        self.assertFalse(full.truncated)
+        prefix = list_revisions_for_part("500-9001-00/", list_html=html)
+        self.assertEqual({e.bom_id for e in prefix.entries}, {"39477", "40001"})
+        capped = list_revisions_for_part(
+            "500-9001-00", list_html=html, max_results=1
+        )
+        self.assertEqual(len(capped.entries), 1)
+        self.assertTrue(capped.truncated)
 
 
 class ClientTests(unittest.TestCase):
@@ -454,20 +469,30 @@ class ClientTests(unittest.TestCase):
         ids = [e.bom_id for e in entries]
         self.assertEqual(ids, ["39477", "40001", "41000", "42000"])
 
-    def test_list_revisions_uses_part_code_filter_postback(self):
-        """Load revisions prefers PartCode EqualTo filter over a full catalog walk."""
+    def test_list_revisions_uses_number_startswith_filter_postback(self):
+        """Load revisions prefers Number StartsWith filter over a full catalog walk."""
         login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
         page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
-        # Inject PartCode filter textbox the live CRM list exposes.
+        # Inject Number filter textbox the live CRM list exposes.
         page1 = page1.replace(
             '<input type="hidden" name="__EVENTVALIDATION"',
-            '<input id="lstEntities_Grid_MasterTableView_ctl02_ctl03_SgTextBox_PartCode" '
-            'name="lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_PartCode" '
+            '<input id="lstEntities_Grid_MasterTableView_ctl02_ctl03_SgTextBox_Number" '
+            'name="lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number" '
             'type="text" value="" />'
             '<input type="hidden" name="__EVENTVALIDATION"',
         )
-        # Filtered async delta: outer updatePanel with only the matching part rows.
+        # Filtered async delta: matching rows only; Next disabled (single page).
         filtered = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        filtered = filtered.replace(
+            '<li class="rtbItem rtbBtn">'
+            '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+            '<li class="rtbItem rtbBtn rtbDisabled">'
+            '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+        ).replace(
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+            '<li class="rcbItem ">صفحه2</li></ul>',
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li></ul>',
+        )
         delta = (
             "1|#||4|"
             f"{len(filtered)}|updatePanel|updatePanel|{filtered}"
@@ -501,20 +526,21 @@ class ClientTests(unittest.TestCase):
         client = SystemGroupClient(
             base_url="http://crm/", username="u", password="p", session=session
         )
-        rows = list_revisions_for_part("500-9001-00", client=client)
-        self.assertEqual({r.bom_id for r in rows}, {"39477", "40001"})
-        # login POST + PartCode filter POST — never pager Next.
+        result = list_revisions_for_part("500-9001-00", client=client)
+        self.assertEqual({r.bom_id for r in result.entries}, {"39477", "40001"})
+        self.assertFalse(result.truncated)
+        # login POST + Number filter POST — never pager Next.
         self.assertEqual(session.post.call_count, 2)
         filter_call = session.post.call_args_list[1]
         posted = filter_call.kwargs.get("data") or filter_call.args[1]
         self.assertEqual(posted["__EVENTTARGET"], "lstEntities$Grid")
         self.assertIn(
-            "FireCommand:lstEntities$Grid$MasterTableView;Filter;PartCode|?500-9001-00|?EqualTo",
+            "FireCommand:lstEntities$Grid$MasterTableView;Filter;Number|?500-9001-00|?StartsWith",
             posted["__EVENTARGUMENT"],
         )
         self.assertEqual(posted["scriptManager"], "updatePanel|lstEntities$Grid")
         self.assertEqual(
-            posted["lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_PartCode"],
+            posted["lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number"],
             "500-9001-00",
         )
 
@@ -593,9 +619,10 @@ class ClientTests(unittest.TestCase):
             "_post_bom_list_part_code_filter",
             side_effect=SystemGroupClientError("no filter"),
         ):
-            rows = list_revisions_for_part("500-9001-00", client=client)
-        self.assertEqual({r.bom_id for r in rows}, {"39477", "40001"})
-        # login POST + one Next (page2 miss after page1 hits) — never page3.
+            result = list_revisions_for_part("500-9001-00", client=client)
+        self.assertEqual({r.bom_id for r in result.entries}, {"39477", "40001"})
+        # Fallback walk: login POST + Next pages until prefix hits stop appearing.
+        # page1 hits, page2 miss → stop (never page3).
         self.assertEqual(session.post.call_count, 2)
 
     def test_customer_orders_report_url_uses_base(self):
