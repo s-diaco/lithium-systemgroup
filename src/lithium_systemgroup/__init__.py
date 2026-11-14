@@ -2,10 +2,14 @@
 
 from .catalog import (
     AmbiguousBomMatch,
+    BomSearchResult,
+    DEFAULT_MAX_RESULTS,
     NoBomMatch,
     SystemGroupError,
+    entry_bom_number,
     list_revisions_for_part,
     load_bom_list_entries,
+    match_number_startswith,
     resolve_bom_from_list,
 )
 from .client import (
@@ -60,7 +64,9 @@ __all__ = [
     "BomLine",
     "BomListEntry",
     "BomListPager",
+    "BomSearchResult",
     "CustomerOrderLine",
+    "DEFAULT_MAX_RESULTS",
     "LoginFormFields",
     "NoBomMatch",
     "ParsedBom",
@@ -82,6 +88,7 @@ __all__ = [
     "deterministic_randbelow",
     "digit_size_for_modulus",
     "encrypted_string",
+    "entry_bom_number",
     "extract_aspnet_form_fields",
     "extract_aspnet_post_fields",
     "extract_bom_id_from_url",
@@ -89,6 +96,7 @@ __all__ = [
     "list_revisions_for_part",
     "load_bom_list_entries",
     "match_bom_list_entries",
+    "match_number_startswith",
     "normalize_crm_decimal",
     "normalize_order_quantity",
     "parse_bom_document",
@@ -104,4 +112,4 @@ __all__ = [
     "unicode_correct_invalid_characters",
 ]
 
-__version__ = "0.2.1"
+__version__ = "0.2.4"

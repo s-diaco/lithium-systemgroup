@@ -39,10 +39,14 @@ DEFAULT_BOM_LIST_PAGE_ID = "1"
 DEFAULT_BOM_LIST_PAGE_WIDTH = "1050"
 DEFAULT_BOM_LIST_PAGE_HEIGHT = "670"
 _BOM_LIST_UPDATE_PANEL_ID = "innerUpdatePanel"
-# PartCode EqualTo filter posts against the outer UpdatePanel (not inner).
+# Number/PartCode filter posts against the outer UpdatePanel (not inner).
 _BOM_LIST_OUTER_UPDATE_PANEL_ID = "updatePanel"
 _BOM_LIST_GRID_UNIQUE_ID = "lstEntities$Grid"
 _BOM_LIST_TABLE_UNIQUE_ID = "lstEntities$Grid$MasterTableView"
+# کد BOM (Number) Supports StartsWith on PN or PN/rev prefixes.
+_NUMBER_TEXTBOX_NAME = re.compile(
+    r'name="(lstEntities\$Grid\$MasterTableView\$[^"]*SgTextBox_Number)"'
+)
 _PART_CODE_TEXTBOX_NAME = re.compile(
     r'name="(lstEntities\$Grid\$MasterTableView\$[^"]*SgTextBox_PartCode)"'
 )
@@ -733,26 +737,37 @@ class SystemGroupClient:
         return urljoin(self.base_url, action.lstrip("./"))
 
     def _post_bom_list_part_code_filter(
-        self, html: str, part_code: str, *, filter_function: str = "EqualTo"
+        self,
+        html: str,
+        part_code: str,
+        *,
+        filter_function: str = "StartsWith",
+        column: str = "Number",
     ) -> tuple[str, str]:
-        """Async-post PartCode column EqualTo/Contains filter; return merged HTML.
+        """Async-post Number/PartCode column filter; return merged HTML.
 
-        CRM inline filter Enter path fires
-        ``FireCommand:<MasterTableView>;Filter;PartCode|?<value>|?<fn>`` against
-        the outer ``updatePanel`` (not ``innerUpdatePanel``). That returns the
-        full matching revision set without walking every list page.
+        Default: ``Number`` + ``StartsWith`` so prefixes like ``2183S509``,
+        ``2183S509/A63*2``, and the full ``کد BOM`` all hit. ``PartCode`` is
+        PN-only and cannot match slash-prefix queries. Posts
+        ``FireCommand:<MasterTableView>;Filter;<column>|?<value>|?<fn>`` against
+        the outer ``updatePanel`` (not ``innerUpdatePanel``).
         """
         pn = (part_code or "").strip()
         if not pn:
             raise SystemGroupClientError("Part code is required to filter the BoM list.")
-        match = _PART_CODE_TEXTBOX_NAME.search(html or "")
+        col = (column or "Number").strip() or "Number"
+        pattern = (
+            _NUMBER_TEXTBOX_NAME if col == "Number" else _PART_CODE_TEXTBOX_NAME
+        )
+        match = pattern.search(html or "")
         if not match:
+            label = "Number" if col == "Number" else "PartCode"
             raise SystemGroupClientError(
-                "BoM list HTML has no PartCode filter textbox "
-                "(SgTextBox_PartCode); cannot filter by part id."
+                f"BoM list HTML has no {label} filter textbox "
+                f"(SgTextBox_{label}); cannot filter by part id."
             )
         textbox = match.group(1)
-        fn = (filter_function or "EqualTo").strip() or "EqualTo"
+        fn = (filter_function or "StartsWith").strip() or "StartsWith"
         # Values containing ";" are escaped by Telerik client filter().
         value = pn.replace(";", "^#")
         action, fields = extract_aspnet_post_fields(html)
@@ -761,7 +776,7 @@ class SystemGroupClient:
         payload["__EVENTTARGET"] = _BOM_LIST_GRID_UNIQUE_ID
         payload["__EVENTARGUMENT"] = (
             f"FireCommand:{_BOM_LIST_TABLE_UNIQUE_ID};Filter;"
-            f"PartCode|?{value}|?{fn}"
+            f"{col}|?{value}|?{fn}"
         )
         payload["__ASYNCPOST"] = "true"
         payload["scriptManager"] = (
@@ -785,7 +800,7 @@ class SystemGroupClient:
             resp.raise_for_status()
         except requests.RequestException as exc:
             raise SystemGroupClientError(
-                f"Could not filter BoM list by PartCode ({url.split('?', 1)[0]}): {exc}"
+                f"Could not filter BoM list by {col} ({url.split('?', 1)[0]}): {exc}"
             ) from exc
         if "login.aspx" in (resp.url or "").lower():
             raise SystemGroupClientError(
@@ -799,7 +814,7 @@ class SystemGroupClient:
             )
         if "|error|" in delta:
             raise SystemGroupClientError(
-                "BoM list PartCode filter postback failed "
+                f"BoM list {col} filter postback failed "
                 f"({url.split('?', 1)[0]}): CRM returned an error delta."
             )
         try:
