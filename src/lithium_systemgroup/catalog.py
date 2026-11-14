@@ -49,8 +49,15 @@ def load_bom_list_entries(
     list_html: str | None = None,
     list_json: str | None = None,
     list_path: str | Path | None = None,
+    stop_part_number: str | None = None,
+    stop_revision: str | None = None,
 ) -> list[BomListEntry]:
-    """Load BoM list rows from offline content/path or live CRM fetch."""
+    """Load BoM list rows from offline content/path or live CRM fetch.
+
+    When ``stop_part_number`` and ``stop_revision`` are both set on a live
+    fetch, stop paging as soon as that exact BoM code match appears (avoids
+    walking the rest of the catalog for a unique PN/rev resolve).
+    """
     try:
         if list_json is not None:
             return parse_bom_list_document(list_json, content_type="application/json")
@@ -69,12 +76,21 @@ def load_bom_list_entries(
         # Walk every EntityListPaging page (CRM defaults to 50 rows/page).
         merged: list[BomListEntry] = []
         seen: set[str] = set()
+        stop_pn = (stop_part_number or "").strip() or None
+        stop_rev = (stop_revision or "").strip() or None
         for body, ctype in sg.iter_bom_list_pages():
-            for entry in parse_bom_list_document(body, content_type=ctype):
+            page_entries = parse_bom_list_document(body, content_type=ctype)
+            for entry in page_entries:
                 if entry.bom_id in seen:
                     continue
                 seen.add(entry.bom_id)
                 merged.append(entry)
+            if stop_pn and stop_rev:
+                hits = match_bom_list_entries(
+                    page_entries, part_number=stop_pn, revision=stop_rev
+                )
+                if hits:
+                    break
         if not merged:
             raise SystemGroupParseError(
                 "No BoM list rows found across paginated list pages."
@@ -134,18 +150,22 @@ def resolve_bom_from_list(
     Raises ``NoBomMatch`` or ``AmbiguousBomMatch``. When neither part_number nor
     description is set, returns AmbiguousBomMatch with the full list (browse).
     """
-    rows = entries if entries is not None else load_bom_list_entries(
-        client=client,
-        list_html=list_html,
-        list_json=list_json,
-        list_path=list_path,
-    )
     pn = (part_number or "").strip() or None
     desc = (description or "").strip() or None
     rev = (revision or "").strip() or None
     query = pn or desc or "(all)"
     if pn and rev:
         query = f"{pn}/{rev}"
+
+    rows = entries if entries is not None else load_bom_list_entries(
+        client=client,
+        list_html=list_html,
+        list_json=list_json,
+        list_path=list_path,
+        # Unique PN/rev resolve can stop once that row is on a fetched page.
+        stop_part_number=pn if (pn and rev) else None,
+        stop_revision=rev if (pn and rev) else None,
+    )
 
     if not pn and not desc:
         raise AmbiguousBomMatch(rows, query)

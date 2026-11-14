@@ -272,7 +272,65 @@ class ClientTests(unittest.TestCase):
             pager.pager_target,
             "lstEntities$Grid$MasterTableView$ctl03$ctl02$Pager",
         )
+        self.assertEqual(pager.next_argument, "3")
         self.assertEqual(pager.fields.get("__EVENTVALIDATION"), "ev-page1")
+
+    def test_parse_pager_next_argument_from_itemdata(self):
+        from lithium_systemgroup import parse_pager_next_argument
+
+        html = (
+            '<div class="EntityListPaging"></div>'
+            r'<script>$create({"itemData":[{"value":"First"},{"value":"Previous"},'
+            r'{"value":"Pages","templated":true},{"value":"Next"},{"value":"Last"}]});'
+            "</script>"
+        )
+        self.assertEqual(parse_pager_next_argument(html), "3")
+
+    def test_strip_clientstate_updated(self):
+        from lithium_systemgroup import strip_clientstate_updated
+
+        fields = {
+            "a": '{"x":1,"__Updated":true}',
+            "b": '{"__Updated":true}',
+            "c": "plain",
+        }
+        out = strip_clientstate_updated(fields)
+        self.assertEqual(out["a"], '{"x":1}')
+        self.assertEqual(out["b"], "{}")
+        self.assertEqual(out["c"], "plain")
+
+    def test_apply_bom_list_async_delta_keeps_pager_target(self):
+        from lithium_systemgroup import apply_bom_list_async_delta
+
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        panel = (
+            '<span id="lstEntities"><div class="EntityListPaging">'
+            '<input id="x_cboPage_Input" value="صفحه2" />'
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+            '<li class="rcbItem ">صفحه2</li></ul>'
+            '<li class="rtbItem rtbBtn"><a title="بعدی" href="#"></a></li>'
+            "</div>"
+            '<table class="rgMasterTable"><tr class="rgRow"><td>1</td></tr></table>'
+            "</span>"
+        )
+        delta = (
+            "1|#||4|"
+            f"{len(panel)}|updatePanel|innerUpdatePanel|{panel}"
+            "|0|hiddenField|__EVENTTARGET|"
+            "|0|hiddenField|__EVENTARGUMENT|"
+            "|0|hiddenField|__VIEWSTATE|"
+            "|11|hiddenField|__EVENTVALIDATION|ev-page2-xx"
+        )
+        merged = apply_bom_list_async_delta(page1, delta)
+        pager = parse_bom_list_pager(merged)
+        self.assertIsNotNone(pager)
+        assert pager is not None
+        self.assertEqual(pager.current_page, 2)
+        self.assertEqual(
+            pager.pager_target,
+            "lstEntities$Grid$MasterTableView$ctl03$ctl02$Pager",
+        )
+        self.assertEqual(pager.fields.get("__EVENTVALIDATION"), "ev-page2-xx")
 
     def test_parse_bom_list_pager_unicode_escaped_quotes(self):
         # Live CRM $create blobs use \u0027 instead of raw quotes.
@@ -348,12 +406,17 @@ class ClientTests(unittest.TestCase):
         # Second session.post is the pager Next (after login post).
         next_call = session.post.call_args_list[1]
         posted = next_call.kwargs.get("data") or next_call.args[1]
+        headers = next_call.kwargs.get("headers") or {}
         self.assertEqual(
             posted["__EVENTTARGET"],
             "lstEntities$Grid$MasterTableView$ctl03$ctl02$Pager",
         )
-        self.assertEqual(posted["__EVENTARGUMENT"], "Next")
+        # Live CRM RadToolBar posts the Next item index, not the string "Next".
+        self.assertEqual(posted["__EVENTARGUMENT"], "3")
+        self.assertEqual(posted["__ASYNCPOST"], "true")
+        self.assertIn("innerUpdatePanel|", posted["scriptManager"])
         self.assertEqual(posted["__EVENTVALIDATION"], "ev-page1")
+        self.assertEqual(headers.get("X-MicrosoftAjax"), "Delta=true")
 
     def test_load_bom_list_entries_merges_pages(self):
         login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
