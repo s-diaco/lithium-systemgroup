@@ -454,6 +454,79 @@ class ClientTests(unittest.TestCase):
         ids = [e.bom_id for e in entries]
         self.assertEqual(ids, ["39477", "40001", "41000", "42000"])
 
+    def test_list_revisions_stops_after_part_cluster(self):
+        """Load revisions must not walk pages after the part-id hit cluster ends."""
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        # Mid page: no 500-9001-00 hits, but Next still enabled (3-page catalog).
+        # Without early-exit, iter would keep posting through page3+.
+        page2 = (
+            (FIXTURES / "bom_list_page2.html")
+            .read_text(encoding="utf-8")
+            .replace("صفحه2", "صفحه2")
+            .replace(
+                '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+                '<li class="rcbItem ">صفحه2</li></ul>',
+                '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+                '<li class="rcbItem ">صفحه2</li>'
+                '<li class="rcbItem ">صفحه3</li></ul>',
+            )
+            .replace(
+                '<li class="rtbItem rtbBtn rtbDisabled">'
+                '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+                '<li class="rtbItem rtbBtn">'
+                '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+            )
+            .replace(
+                '<li class="rtbItem rtbBtn rtbDisabled">'
+                '<a title="انتها" class="rtbWrap" href="#"><span>Last</span></a></li>',
+                '<li class="rtbItem rtbBtn">'
+                '<a title="انتها" class="rtbWrap" href="#"><span>Last</span></a></li>',
+            )
+        )
+        page3 = page2.replace("صفحه2", "صفحه3").replace("ev-page2", "ev-page3")
+        page3 = page3.replace("41,000", "51,000").replace("41000", "51000")
+        page3 = page3.replace("42,000", "52,000").replace("42000", "52000")
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        next_post = mock.Mock(
+            status_code=200,
+            text=page2,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        next_post.raise_for_status = mock.Mock()
+        page3_post = mock.Mock(
+            status_code=200,
+            text=page3,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        page3_post.raise_for_status = mock.Mock()
+        session.get.side_effect = [login_get, list_get]
+        session.post.side_effect = [login_post, next_post, page3_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        rows = list_revisions_for_part("500-9001-00", client=client)
+        self.assertEqual({r.bom_id for r in rows}, {"39477", "40001"})
+        # login POST + one Next (page2 miss after page1 hits) — never page3.
+        self.assertEqual(session.post.call_count, 2)
+
     def test_customer_orders_report_url_uses_base(self):
         url = customer_orders_report_url("http://crm.example/", "ReportViewer.aspx?x=1")
         self.assertTrue(url.startswith("http://crm.example/"))
