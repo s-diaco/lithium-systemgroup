@@ -54,9 +54,13 @@ def load_bom_list_entries(
 ) -> list[BomListEntry]:
     """Load BoM list rows from offline content/path or live CRM fetch.
 
-    When ``stop_part_number`` and ``stop_revision`` are both set on a live
-    fetch, stop paging as soon as that exact BoM code match appears (avoids
-    walking the rest of the catalog for a unique PN/rev resolve).
+    Live fetch shortcuts (avoid walking the full catalog):
+
+    - ``stop_part_number`` alone: PartCode header ``EqualTo`` filter postback
+      (complete revision set for Load revisions). Falls back to paging with a
+      part-id hit-cluster stop if the filter postback is unavailable.
+    - ``stop_part_number`` + ``stop_revision``: stop on the first page that
+      contains that exact BoM code (unique PN/rev resolve).
     """
     try:
         if list_json is not None:
@@ -73,11 +77,27 @@ def load_bom_list_entries(
             )
             return parse_bom_list_document(content, content_type=ctype)
         sg = client or SystemGroupClient()
-        # Walk every EntityListPaging page (CRM defaults to 50 rows/page).
-        merged: list[BomListEntry] = []
-        seen: set[str] = set()
         stop_pn = (stop_part_number or "").strip() or None
         stop_rev = (stop_revision or "").strip() or None
+
+        # Prefer CRM PartCode EqualTo filter for part-only loads (all revs).
+        if stop_pn and not stop_rev:
+            try:
+                if not sg._logged_in:
+                    sg.login()
+                body, ctype = sg.fetch_bom_list()
+                body, ctype = sg._post_bom_list_part_code_filter(body, stop_pn)
+                filtered = parse_bom_list_document(body, content_type=ctype)
+                if filtered:
+                    return filtered
+            except (SystemGroupClientError, SystemGroupParseError):
+                # Fall through to paginated walk + cluster early-exit.
+                pass
+
+        # Walk EntityListPaging pages (CRM defaults to 50 rows/page).
+        merged: list[BomListEntry] = []
+        seen: set[str] = set()
+        seen_part_hits = False
         for body, ctype in sg.iter_bom_list_pages():
             page_entries = parse_bom_list_document(body, content_type=ctype)
             for entry in page_entries:
@@ -85,12 +105,20 @@ def load_bom_list_entries(
                     continue
                 seen.add(entry.bom_id)
                 merged.append(entry)
-            if stop_pn and stop_rev:
-                hits = match_bom_list_entries(
-                    page_entries, part_number=stop_pn, revision=stop_rev
-                )
+            if not stop_pn:
+                continue
+            hits = match_bom_list_entries(
+                page_entries, part_number=stop_pn, revision=stop_rev
+            )
+            if stop_rev:
                 if hits:
                     break
+                continue
+            # Part-only fallback: keep paging through the hit cluster, then miss.
+            if hits:
+                seen_part_hits = True
+            elif seen_part_hits:
+                break
         if not merged:
             raise SystemGroupParseError(
                 "No BoM list rows found across paginated list pages."
@@ -113,6 +141,10 @@ def list_revisions_for_part(
 
     Raises ``NoBomMatch`` when nothing matches. Does not raise
     ``AmbiguousBomMatch`` — callers always get the full revision set.
+
+    Live CRM fetches use the PartCode header EqualTo filter (see
+    ``load_bom_list_entries``) so Load revisions returns every revision
+    without walking the unfiltered catalog.
     """
     pn = (part_number or "").strip()
     if not pn:
@@ -124,6 +156,7 @@ def list_revisions_for_part(
         list_html=list_html,
         list_json=list_json,
         list_path=list_path,
+        stop_part_number=pn,
     )
     matches = match_bom_list_entries(rows, part_number=pn, revision=None)
     if not matches:

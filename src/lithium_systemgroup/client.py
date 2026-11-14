@@ -39,6 +39,13 @@ DEFAULT_BOM_LIST_PAGE_ID = "1"
 DEFAULT_BOM_LIST_PAGE_WIDTH = "1050"
 DEFAULT_BOM_LIST_PAGE_HEIGHT = "670"
 _BOM_LIST_UPDATE_PANEL_ID = "innerUpdatePanel"
+# PartCode EqualTo filter posts against the outer UpdatePanel (not inner).
+_BOM_LIST_OUTER_UPDATE_PANEL_ID = "updatePanel"
+_BOM_LIST_GRID_UNIQUE_ID = "lstEntities$Grid"
+_BOM_LIST_TABLE_UNIQUE_ID = "lstEntities$Grid$MasterTableView"
+_PART_CODE_TEXTBOX_NAME = re.compile(
+    r'name="(lstEntities\$Grid\$MasterTableView\$[^"]*SgTextBox_PartCode)"'
+)
 # Store report: sales delivery notes with remaining balance (path only; host from env).
 DEFAULT_CUSTOMER_ORDERS_REPORT_PATH = (
     "ReportViewer.aspx?ShowParameterPanel=true&ReportPath="
@@ -301,8 +308,11 @@ _PAGER_SCRIPT = re.compile(
 
 
 def apply_bom_list_async_delta(html: str, delta: str) -> str:
-    """Merge an async Next delta into list HTML for the next postback round."""
+    """Merge an async Next/Filter delta into list HTML for the next postback round."""
     panel = extract_async_update_panel(delta)
+    if not panel:
+        # PartCode header filter refreshes the outer UpdatePanel id.
+        panel = extract_async_update_panel(delta, _BOM_LIST_OUTER_UPDATE_PANEL_ID)
     if not panel:
         raise SystemGroupClientError(
             "BoM list Next postback returned no updatePanel delta."
@@ -321,9 +331,15 @@ def apply_bom_list_async_delta(html: str, delta: str) -> str:
         f'value="{html_escape(value, quote=True)}" />'
         for name, value in fields.items()
     )
-    # updatePanel HTML omits the pager $create blob; keep it from the prior page
-    # so parse_bom_list_pager still finds pager_target / Next item index.
-    pager_scripts = "".join(_PAGER_SCRIPT.findall(html or ""))
+    # updatePanel HTML may omit the pager $create blob; keep bare pager scripts
+    # from the prior page so parse_bom_list_pager still finds pager_target.
+    # Skip any "script" match that embeds grid rows (over-broad scrape would
+    # re-inject the unfiltered catalog after a PartCode filter delta).
+    pager_scripts = "".join(
+        s
+        for s in _PAGER_SCRIPT.findall(html or "")
+        if "rgRow" not in s and "rgAltRow" not in s
+    )
     action_attr = html_escape(action or "", quote=True)
     return (
         f'<form method="post" action="{action_attr}">'
@@ -715,6 +731,84 @@ class SystemGroupClient:
         if not action:
             return bom_list_frame_url(self.base_url)
         return urljoin(self.base_url, action.lstrip("./"))
+
+    def _post_bom_list_part_code_filter(
+        self, html: str, part_code: str, *, filter_function: str = "EqualTo"
+    ) -> tuple[str, str]:
+        """Async-post PartCode column EqualTo/Contains filter; return merged HTML.
+
+        CRM inline filter Enter path fires
+        ``FireCommand:<MasterTableView>;Filter;PartCode|?<value>|?<fn>`` against
+        the outer ``updatePanel`` (not ``innerUpdatePanel``). That returns the
+        full matching revision set without walking every list page.
+        """
+        pn = (part_code or "").strip()
+        if not pn:
+            raise SystemGroupClientError("Part code is required to filter the BoM list.")
+        match = _PART_CODE_TEXTBOX_NAME.search(html or "")
+        if not match:
+            raise SystemGroupClientError(
+                "BoM list HTML has no PartCode filter textbox "
+                "(SgTextBox_PartCode); cannot filter by part id."
+            )
+        textbox = match.group(1)
+        fn = (filter_function or "EqualTo").strip() or "EqualTo"
+        # Values containing ";" are escaped by Telerik client filter().
+        value = pn.replace(";", "^#")
+        action, fields = extract_aspnet_post_fields(html)
+        payload = strip_clientstate_updated(fields)
+        payload[textbox] = pn
+        payload["__EVENTTARGET"] = _BOM_LIST_GRID_UNIQUE_ID
+        payload["__EVENTARGUMENT"] = (
+            f"FireCommand:{_BOM_LIST_TABLE_UNIQUE_ID};Filter;"
+            f"PartCode|?{value}|?{fn}"
+        )
+        payload["__ASYNCPOST"] = "true"
+        payload["scriptManager"] = (
+            f"{_BOM_LIST_OUTER_UPDATE_PANEL_ID}|{_BOM_LIST_GRID_UNIQUE_ID}"
+        )
+        url = self._bom_list_post_url(action)
+        headers = {
+            "Referer": url,
+            "X-MicrosoftAjax": "Delta=true",
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        try:
+            resp = self.session.post(
+                url,
+                data=payload,
+                headers=headers,
+                timeout=self.timeout,
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            raise SystemGroupClientError(
+                f"Could not filter BoM list by PartCode ({url.split('?', 1)[0]}): {exc}"
+            ) from exc
+        if "login.aspx" in (resp.url or "").lower():
+            raise SystemGroupClientError(
+                "BoM list filter postback redirected to login; check credentials."
+            )
+        delta = resp.text
+        if "view state is expired" in delta.lower():
+            raise SystemGroupClientError(
+                "BoM list filter postback failed: page ViewState expired. "
+                "Use the Shell-framed List URL (PageID/TimeStamp)."
+            )
+        if "|error|" in delta:
+            raise SystemGroupClientError(
+                "BoM list PartCode filter postback failed "
+                f"({url.split('?', 1)[0]}): CRM returned an error delta."
+            )
+        try:
+            merged = apply_bom_list_async_delta(html, delta)
+        except SystemGroupClientError:
+            if "EntityListPaging" in delta or "rgRow" in delta:
+                return delta, resp.headers.get("Content-Type", "text/html")
+            raise
+        return merged, "text/html"
 
     def _post_bom_list_next(
         self, html: str, pager: BomListPager

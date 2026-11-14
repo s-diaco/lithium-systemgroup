@@ -454,6 +454,150 @@ class ClientTests(unittest.TestCase):
         ids = [e.bom_id for e in entries]
         self.assertEqual(ids, ["39477", "40001", "41000", "42000"])
 
+    def test_list_revisions_uses_part_code_filter_postback(self):
+        """Load revisions prefers PartCode EqualTo filter over a full catalog walk."""
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        # Inject PartCode filter textbox the live CRM list exposes.
+        page1 = page1.replace(
+            '<input type="hidden" name="__EVENTVALIDATION"',
+            '<input id="lstEntities_Grid_MasterTableView_ctl02_ctl03_SgTextBox_PartCode" '
+            'name="lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_PartCode" '
+            'type="text" value="" />'
+            '<input type="hidden" name="__EVENTVALIDATION"',
+        )
+        # Filtered async delta: outer updatePanel with only the matching part rows.
+        filtered = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        delta = (
+            "1|#||4|"
+            f"{len(filtered)}|updatePanel|updatePanel|{filtered}"
+            "|0|hiddenField|__EVENTTARGET||0|hiddenField|__EVENTARGUMENT|"
+        )
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        filter_post = mock.Mock(
+            status_code=200,
+            text=delta,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/plain"},
+        )
+        filter_post.raise_for_status = mock.Mock()
+        session.get.side_effect = [login_get, list_get]
+        session.post.side_effect = [login_post, filter_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        rows = list_revisions_for_part("500-9001-00", client=client)
+        self.assertEqual({r.bom_id for r in rows}, {"39477", "40001"})
+        # login POST + PartCode filter POST — never pager Next.
+        self.assertEqual(session.post.call_count, 2)
+        filter_call = session.post.call_args_list[1]
+        posted = filter_call.kwargs.get("data") or filter_call.args[1]
+        self.assertEqual(posted["__EVENTTARGET"], "lstEntities$Grid")
+        self.assertIn(
+            "FireCommand:lstEntities$Grid$MasterTableView;Filter;PartCode|?500-9001-00|?EqualTo",
+            posted["__EVENTARGUMENT"],
+        )
+        self.assertEqual(posted["scriptManager"], "updatePanel|lstEntities$Grid")
+        self.assertEqual(
+            posted["lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_PartCode"],
+            "500-9001-00",
+        )
+
+    def test_list_revisions_stops_after_part_cluster(self):
+        """Load revisions must not walk pages after the part-id hit cluster ends."""
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        # Mid page: no 500-9001-00 hits, but Next still enabled (3-page catalog).
+        # Without early-exit, iter would keep posting through page3+.
+        page2 = (
+            (FIXTURES / "bom_list_page2.html")
+            .read_text(encoding="utf-8")
+            .replace("صفحه2", "صفحه2")
+            .replace(
+                '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+                '<li class="rcbItem ">صفحه2</li></ul>',
+                '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+                '<li class="rcbItem ">صفحه2</li>'
+                '<li class="rcbItem ">صفحه3</li></ul>',
+            )
+            .replace(
+                '<li class="rtbItem rtbBtn rtbDisabled">'
+                '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+                '<li class="rtbItem rtbBtn">'
+                '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+            )
+            .replace(
+                '<li class="rtbItem rtbBtn rtbDisabled">'
+                '<a title="انتها" class="rtbWrap" href="#"><span>Last</span></a></li>',
+                '<li class="rtbItem rtbBtn">'
+                '<a title="انتها" class="rtbWrap" href="#"><span>Last</span></a></li>',
+            )
+        )
+        page3 = page2.replace("صفحه2", "صفحه3").replace("ev-page2", "ev-page3")
+        page3 = page3.replace("41,000", "51,000").replace("41000", "51000")
+        page3 = page3.replace("42,000", "52,000").replace("42000", "52000")
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        next_post = mock.Mock(
+            status_code=200,
+            text=page2,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        next_post.raise_for_status = mock.Mock()
+        page3_post = mock.Mock(
+            status_code=200,
+            text=page3,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        page3_post.raise_for_status = mock.Mock()
+        # PartCode filter is attempted first (no textbox → fails), then cluster walk.
+        # fetch_bom_list may try framed + fallback URLs; allow extra list GETs.
+        session.get.side_effect = [login_get] + [list_get] * 6
+        session.post.side_effect = [login_post, next_post, page3_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        with mock.patch.object(
+            SystemGroupClient,
+            "_post_bom_list_part_code_filter",
+            side_effect=SystemGroupClientError("no filter"),
+        ):
+            rows = list_revisions_for_part("500-9001-00", client=client)
+        self.assertEqual({r.bom_id for r in rows}, {"39477", "40001"})
+        # login POST + one Next (page2 miss after page1 hits) — never page3.
+        self.assertEqual(session.post.call_count, 2)
+
     def test_customer_orders_report_url_uses_base(self):
         url = customer_orders_report_url("http://crm.example/", "ReportViewer.aspx?x=1")
         self.assertTrue(url.startswith("http://crm.example/"))
