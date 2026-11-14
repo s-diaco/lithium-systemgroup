@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import time
 from dataclasses import dataclass
+from html import escape as html_escape
 from html import unescape
 from typing import Iterator
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse, urlunparse
@@ -26,6 +29,16 @@ DEFAULT_BOM_LIST_PAGE = (
 )
 # SgGridView EntityListPaging defaults to 50 rows; CRM list often spans many pages.
 DEFAULT_BOM_LIST_MAX_PAGES = 500
+# CRM ScriptManager enables partial rendering only for real browser UAs.
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+# Shell iframe List.aspx keys server-side ViewState via PageID/TimeStamp.
+DEFAULT_BOM_LIST_PAGE_ID = "1"
+DEFAULT_BOM_LIST_PAGE_WIDTH = "1050"
+DEFAULT_BOM_LIST_PAGE_HEIGHT = "670"
+_BOM_LIST_UPDATE_PANEL_ID = "innerUpdatePanel"
 # Store report: sales delivery notes with remaining balance (path only; host from env).
 DEFAULT_CUSTOMER_ORDERS_REPORT_PATH = (
     "ReportViewer.aspx?ShowParameterPanel=true&ReportPath="
@@ -81,6 +94,15 @@ _NEXT_BUTTON = re.compile(
     r'<li\b([^>]*)>\s*<a\b[^>]*title="بعدی"',
     re.IGNORECASE,
 )
+_INPUT_TAG = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
+_PAGER_ITEM_DATA = re.compile(
+    r'"itemData"\s*:\s*(\[[^\]]*\{[^]]*Next[^]]*\}[^\]]*\])',
+    re.IGNORECASE,
+)
+_DELTA_HIDDEN_FIELD = re.compile(
+    r"\|(\d+)\|hiddenField\|([^|]*)\|",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -93,6 +115,8 @@ class BomListPager:
     current_page: int
     page_count: int
     next_enabled: bool
+    # RadToolBar posts the Next item's index (not the string "Next").
+    next_argument: str = "3"
 
 
 def extract_aspnet_form_fields(html: str) -> tuple[str, dict[str, str]]:
@@ -111,6 +135,75 @@ def extract_aspnet_form_fields(html: str) -> tuple[str, dict[str, str]]:
     return action, fields
 
 
+def extract_aspnet_post_fields(html: str) -> tuple[str, dict[str, str]]:
+    """Return (form action, successful control map) like a browser form POST.
+
+    Includes hidden and visible text inputs (cboPage, filters, etc.). Checkboxes /
+    radios are only included when marked checked. Submit/button/image/file skipped.
+    """
+    action_match = _FORM_ACTION.search(html or "")
+    action = unescape(action_match.group(1)) if action_match else ""
+    fields: dict[str, str] = {}
+    for tag in _INPUT_TAG.findall(html or ""):
+        name_match = _INPUT_NAME.search(tag)
+        if not name_match:
+            continue
+        type_match = re.search(
+            r'\btype\s*=\s*["\']([^"\']+)["\']', tag, re.IGNORECASE
+        )
+        itype = (type_match.group(1) if type_match else "text").lower()
+        if itype in ("submit", "button", "image", "file"):
+            continue
+        if itype in ("checkbox", "radio") and "checked" not in tag.lower():
+            continue
+        value_match = _INPUT_VALUE.search(tag)
+        fields[name_match.group(1)] = (
+            unescape(value_match.group(1)) if value_match else ""
+        )
+    return action, fields
+
+
+def strip_clientstate_updated(fields: dict[str, str]) -> dict[str, str]:
+    """Drop reserved ``__Updated`` markers from Sg ClientState JSON values."""
+    out: dict[str, str] = {}
+    for key, value in fields.items():
+        if (
+            isinstance(value, str)
+            and value.startswith("{")
+            and '"__Updated"' in value
+        ):
+            try:
+                obj = json.loads(value)
+            except json.JSONDecodeError:
+                out[key] = value
+                continue
+            if isinstance(obj, dict) and "__Updated" in obj:
+                obj = dict(obj)
+                obj.pop("__Updated", None)
+                value = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+        out[key] = value
+    return out
+
+
+def parse_pager_next_argument(html: str) -> str:
+    """Return RadToolBar item index for Next (live CRM posts this, not ``Next``)."""
+    match = _PAGER_ITEM_DATA.search(html or "")
+    if match:
+        raw = match.group(1)
+        try:
+            items = json.loads(raw.encode("utf-8").decode("unicode_escape"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            try:
+                items = json.loads(raw)
+            except json.JSONDecodeError:
+                items = None
+        if isinstance(items, list):
+            for index, item in enumerate(items):
+                if isinstance(item, dict) and item.get("value") == "Next":
+                    return str(index)
+    return "3"
+
+
 def parse_bom_list_pager(html: str) -> BomListPager | None:
     """Parse EntityListPaging state from BoM list HTML, or None if absent."""
     if not html:
@@ -123,7 +216,7 @@ def parse_bom_list_pager(html: str) -> BomListPager | None:
     if not has_pager_chrome:
         return None
 
-    action, fields = extract_aspnet_form_fields(html)
+    action, fields = extract_aspnet_post_fields(html)
     pager_target: str | None = None
     for match in _PAGER_POSTBACK_TARGET.finditer(html):
         target = match.group(1)
@@ -167,6 +260,74 @@ def parse_bom_list_pager(html: str) -> BomListPager | None:
         current_page=current_page,
         page_count=max(page_count, current_page, 1),
         next_enabled=next_enabled,
+        next_argument=parse_pager_next_argument(html),
+    )
+
+
+def extract_async_update_panel(
+    delta: str, panel_id: str = _BOM_LIST_UPDATE_PANEL_ID
+) -> str | None:
+    """Pull ``updatePanel`` HTML out of an ASP.NET async postback delta."""
+    marker = f"|updatePanel|{panel_id}|"
+    start = (delta or "").find(marker)
+    if start < 0:
+        return None
+    content_start = start + len(marker)
+    # Panel HTML ends where hiddenField nodes begin (CRM List.aspx shape).
+    end = delta.find("|0|hiddenField|", content_start)
+    if end < 0:
+        end = delta.find("|hiddenField|", content_start)
+    if end < 0:
+        return delta[content_start:]
+    return delta[content_start:end]
+
+
+def extract_async_hidden_fields(delta: str) -> dict[str, str]:
+    """Parse ``hiddenField`` nodes from an ASP.NET async postback delta."""
+    fields: dict[str, str] = {}
+    text = delta or ""
+    for match in _DELTA_HIDDEN_FIELD.finditer(text):
+        length = int(match.group(1))
+        name = match.group(2)
+        content_start = match.end()
+        fields[name] = text[content_start : content_start + length]
+    return fields
+
+
+_PAGER_SCRIPT = re.compile(
+    r"<script\b[^>]*>[\s\S]*?PostBackOptions\([\s\S]*?Pager[\s\S]*?</script>",
+    re.IGNORECASE,
+)
+
+
+def apply_bom_list_async_delta(html: str, delta: str) -> str:
+    """Merge an async Next delta into list HTML for the next postback round."""
+    panel = extract_async_update_panel(delta)
+    if not panel:
+        raise SystemGroupClientError(
+            "BoM list Next postback returned no updatePanel delta."
+        )
+    action, fields = extract_aspnet_post_fields(html)
+    fields.update(extract_async_hidden_fields(delta))
+    fields.update(extract_aspnet_post_fields(panel)[1])
+    # Drop event target leftovers from the previous post.
+    fields["__EVENTTARGET"] = ""
+    fields["__EVENTARGUMENT"] = ""
+    fields.pop("__ASYNCPOST", None)
+    if "scriptManager" in fields and "|" in (fields.get("scriptManager") or ""):
+        fields["scriptManager"] = ""
+    hidden = "".join(
+        f'<input type="hidden" name="{html_escape(name, quote=True)}" '
+        f'value="{html_escape(value, quote=True)}" />'
+        for name, value in fields.items()
+    )
+    # updatePanel HTML omits the pager $create blob; keep it from the prior page
+    # so parse_bom_list_pager still finds pager_target / Next item index.
+    pager_scripts = "".join(_PAGER_SCRIPT.findall(html or ""))
+    action_attr = html_escape(action or "", quote=True)
+    return (
+        f'<form method="post" action="{action_attr}">'
+        f"{hidden}{panel}{pager_scripts}</form>"
     )
 
 
@@ -297,6 +458,24 @@ def bom_list_direct_url(base_url: str) -> str:
     return urljoin(base_url, DEFAULT_BOM_LIST_PAGE)
 
 
+def bom_list_frame_url(
+    base_url: str,
+    *,
+    page_id: str = DEFAULT_BOM_LIST_PAGE_ID,
+    timestamp_ms: int | None = None,
+    page_width: str = DEFAULT_BOM_LIST_PAGE_WIDTH,
+    page_height: str = DEFAULT_BOM_LIST_PAGE_HEIGHT,
+) -> str:
+    """List.aspx URL as loaded inside Shell (PageID/TimeStamp key ViewState)."""
+    ts = int(time.time() * 1000) if timestamp_ms is None else int(timestamp_ms)
+    return urljoin(
+        base_url,
+        f"{DEFAULT_BOM_LIST_PAGE}"
+        f"&PageID={page_id}&TimeStamp={ts}"
+        f"&PageWidth={page_width}&PageHeight={page_height}",
+    )
+
+
 class SystemGroupClient:
     """Session-backed forms-auth client."""
 
@@ -320,8 +499,14 @@ class SystemGroupClient:
         self.username = username
         self.password = password
         self.timeout = timeout
+        owned_session = session is None
         self.session = session or requests.Session()
+        # requests' default UA makes CRM ScriptManager set
+        # SupportsPartialRendering=false; use a browser UA for owned sessions.
+        if owned_session:
+            self.session.headers["User-Agent"] = DEFAULT_USER_AGENT
         self._logged_in = False
+        self._bom_list_frame_url: str | None = None
 
     def login_url(self) -> str:
         return urljoin(self.base_url, DEFAULT_LOGIN_PATH.lstrip("/"))
@@ -476,8 +661,9 @@ class SystemGroupClient:
     def fetch_bom_list(self) -> tuple[str, str]:
         """Return (body_text, content_type) for the first BoM list page.
 
-        Prefers direct List.aspx (has SgGridView/Telerik rows). Shell.aspx is
-        chrome-only on this CRM and yields no ``rgRow`` grid.
+        Prefers the Shell-framed List.aspx URL (PageID/TimeStamp) so pager
+        postbacks keep a valid server ViewState. Falls back to bare List.aspx
+        for one-shot row reads when the framed URL is unavailable.
 
         For the full catalog (every pager page), use ``iter_bom_list_pages``.
         """
@@ -490,7 +676,29 @@ class SystemGroupClient:
                 return False
             return "rgrow" in lower or "mastertableview" in lower or "کد bom" in lower
 
-        return self._fetch_first_ok(
+        frame_url = bom_list_frame_url(self.base_url)
+        try:
+            resp = self.session.get(
+                frame_url, timeout=self.timeout, allow_redirects=True
+            )
+            resp.raise_for_status()
+            ctype = resp.headers.get("Content-Type", "text/html")
+            if (
+                "login.aspx" not in (resp.url or "").lower()
+                and _looks_like_list(resp.text, ctype)
+            ):
+                action, _ = extract_aspnet_form_fields(resp.text)
+                if action and "PageID=" in action:
+                    self._bom_list_frame_url = urljoin(
+                        self.base_url, action.lstrip("./")
+                    )
+                else:
+                    self._bom_list_frame_url = resp.url or frame_url
+                return resp.text, ctype
+        except requests.RequestException:
+            pass
+
+        body, ctype = self._fetch_first_ok(
             [
                 bom_list_direct_url(self.base_url),
                 bom_list_url(self.base_url),
@@ -498,28 +706,46 @@ class SystemGroupClient:
             "BoM list page",
             prefer_predicate=_looks_like_list,
         )
+        return body, ctype
 
     def _bom_list_post_url(self, action: str) -> str:
         """Resolve list form action against the CRM base URL."""
+        if self._bom_list_frame_url:
+            return self._bom_list_frame_url
         if not action:
-            return bom_list_direct_url(self.base_url)
+            return bom_list_frame_url(self.base_url)
         return urljoin(self.base_url, action.lstrip("./"))
 
     def _post_bom_list_next(
         self, html: str, pager: BomListPager
     ) -> tuple[str, str]:
-        """POST EntityListPaging ``Next`` and return (body, content_type)."""
+        """Async-post EntityListPaging Next; return merged next-page HTML."""
         if not pager.pager_target:
             raise SystemGroupClientError(
                 "BoM list pager has no postback target for Next."
             )
-        payload = dict(pager.fields)
+        _, fields = extract_aspnet_post_fields(html)
+        payload = strip_clientstate_updated(fields)
         payload["__EVENTTARGET"] = pager.pager_target
-        payload["__EVENTARGUMENT"] = "Next"
+        payload["__EVENTARGUMENT"] = pager.next_argument or "3"
+        payload["__ASYNCPOST"] = "true"
+        payload["scriptManager"] = (
+            f"{_BOM_LIST_UPDATE_PANEL_ID}|{pager.pager_target}"
+        )
         url = self._bom_list_post_url(pager.action)
+        headers = {
+            "Referer": url,
+            "X-MicrosoftAjax": "Delta=true",
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
         try:
             resp = self.session.post(
-                url, data=payload, timeout=self.timeout, allow_redirects=True
+                url,
+                data=payload,
+                headers=headers,
+                timeout=self.timeout,
+                allow_redirects=True,
             )
             resp.raise_for_status()
         except requests.RequestException as exc:
@@ -530,15 +756,35 @@ class SystemGroupClient:
             raise SystemGroupClientError(
                 "BoM list page postback redirected to login; check credentials."
             )
-        return resp.text, resp.headers.get("Content-Type", "text/html")
+        delta = resp.text
+        if "view state is expired" in delta.lower():
+            raise SystemGroupClientError(
+                "BoM list Next postback failed: page ViewState expired. "
+                "Use the Shell-framed List URL (PageID/TimeStamp)."
+            )
+        if "|error|" in delta or (
+            "updatePanel" not in delta and "EntityListPaging" not in delta
+        ):
+            raise SystemGroupClientError(
+                "BoM list Next postback failed "
+                f"({url.split('?', 1)[0]}): CRM returned an error delta."
+            )
+        try:
+            merged = apply_bom_list_async_delta(html, delta)
+        except SystemGroupClientError:
+            # Full HTML response (non-async) — rare but usable.
+            if "EntityListPaging" in delta or "rgRow" in delta:
+                return delta, resp.headers.get("Content-Type", "text/html")
+            raise
+        return merged, "text/html"
 
     def iter_bom_list_pages(
         self, *, max_pages: int | None = None
     ) -> Iterator[tuple[str, str]]:
         """Yield (body, content_type) for every EntityListPaging page.
 
-        Starts with a GET of the first page, then ASP.NET postbacks with
-        ``__EVENTARGUMENT=Next`` on the SgToolBar pager until Next is
+        Starts with a GET of the Shell-framed first page, then ASP.NET async
+        postbacks with the pager toolbar item index for Next until Next is
         disabled, the page index stops advancing, or ``max_pages`` is hit.
         """
         if not self._logged_in:
