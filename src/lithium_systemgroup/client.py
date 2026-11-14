@@ -331,9 +331,15 @@ def apply_bom_list_async_delta(html: str, delta: str) -> str:
         f'value="{html_escape(value, quote=True)}" />'
         for name, value in fields.items()
     )
-    # updatePanel HTML omits the pager $create blob; keep it from the prior page
-    # so parse_bom_list_pager still finds pager_target / Next item index.
-    pager_scripts = "".join(_PAGER_SCRIPT.findall(html or ""))
+    # updatePanel HTML may omit the pager $create blob; keep bare pager scripts
+    # from the prior page so parse_bom_list_pager still finds pager_target.
+    # Skip any "script" match that embeds grid rows (over-broad scrape would
+    # re-inject the unfiltered catalog after a PartCode filter delta).
+    pager_scripts = "".join(
+        s
+        for s in _PAGER_SCRIPT.findall(html or "")
+        if "rgRow" not in s and "rgAltRow" not in s
+    )
     action_attr = html_escape(action or "", quote=True)
     return (
         f'<form method="post" action="{action_attr}">'
