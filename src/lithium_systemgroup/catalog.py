@@ -280,10 +280,9 @@ def _load_via_number_startswith(
             truncated = True
             break
         current, current_ctype = sg._post_bom_list_next(current, pager)
-    if not merged:
-        raise SystemGroupParseError(
-            f"No BoM list rows matched Number StartsWith '{prefix}'."
-        )
+    # Path B: filter postback succeeded and pages parsed, but nothing StartsWith.
+    # Return empty so callers raise NoBomMatch — do NOT fall through to a full
+    # catalog walk (that catch is for ClientError / ambiguous parse-empty).
     return BomSearchResult(
         entries=merged,
         truncated=truncated,
