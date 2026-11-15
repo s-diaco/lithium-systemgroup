@@ -607,8 +607,8 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(session.post.call_count, 2)
         self.assertEqual(session.get.call_count, 2)
 
-    def test_list_revisions_parse_empty_filter_still_falls_through(self):
-        """Path A: filter HTML with no parseable rows still uses catalog fallback."""
+    def test_list_revisions_rg_no_records_skips_catalog_fallback(self):
+        """Path A (trustworthy): rgNoRecords empty miss → NoBomMatch, no walk."""
         login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
         page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
         page1 = page1.replace(
@@ -618,7 +618,71 @@ class ClientTests(unittest.TestCase):
             'type="text" value="" />'
             '<input type="hidden" name="__EVENTVALIDATION"',
         )
-        # Empty grid chrome — parse_bom_list_document raises (ambiguous empty).
+        # Live CRM empty-miss chrome: rgNoRecords, no rgRow/rgAltRow.
+        empty_grid = (
+            '<form method="post" action="List.aspx">'
+            '<input type="hidden" name="__VIEWSTATE" value="vs" />'
+            '<input id="lstEntities_Grid_MasterTableView_ctl02_ctl03_SgTextBox_Number" '
+            'name="lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number" '
+            'type="text" value="ZZZ-NO-SUCH-PART" />'
+            '<div id="EntityListPaging"></div>'
+            '<table class="rgMasterTable"><thead></thead><tbody>'
+            '<tr class="rgNoRecords"><td colspan="9">'
+            "<div>سطری برای نمایش وجود ندارد.</div></td></tr>"
+            "</tbody></table>"
+            "</form>"
+        )
+        delta = (
+            "1|#||4|"
+            f"{len(empty_grid)}|updatePanel|updatePanel|{empty_grid}"
+            "|0|hiddenField|__EVENTTARGET||0|hiddenField|__EVENTARGUMENT|"
+        )
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        filter_post = mock.Mock(
+            status_code=200,
+            text=delta,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/plain"},
+        )
+        filter_post.raise_for_status = mock.Mock()
+        session.get.side_effect = [login_get, list_get]
+        session.post.side_effect = [login_post, filter_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        with self.assertRaises(NoBomMatch):
+            list_revisions_for_part("ZZZ-NO-SUCH-PART", client=client)
+        # login + filter only — no catalog Next fallback.
+        self.assertEqual(session.post.call_count, 2)
+        self.assertEqual(session.get.call_count, 2)
+
+    def test_list_revisions_ambiguous_empty_filter_still_falls_through(self):
+        """Ambiguous empty (no rgNoRecords) still uses catalog fallback."""
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        page1 = page1.replace(
+            '<input type="hidden" name="__EVENTVALIDATION"',
+            '<input id="lstEntities_Grid_MasterTableView_ctl02_ctl03_SgTextBox_Number" '
+            'name="lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number" '
+            'type="text" value="" />'
+            '<input type="hidden" name="__EVENTVALIDATION"',
+        )
+        # Empty grid chrome without rgNoRecords — parse raises (ambiguous).
         empty_grid = (
             '<form method="post" action="List.aspx">'
             '<input type="hidden" name="__VIEWSTATE" value="vs" />'

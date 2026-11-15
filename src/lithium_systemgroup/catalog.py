@@ -166,7 +166,9 @@ def _load_bom_list_entries(
                     sg, prefix=prefix, max_results=cap
                 )
             except (SystemGroupClientError, SystemGroupParseError):
-                # Fall through to paginated walk + local StartsWith + cap.
+                # Fall through only for ClientError / ambiguous parse-empty
+                # (no rgNoRecords). Trustworthy empty is handled inside
+                # _load_via_number_startswith and never reaches here.
                 pass
 
         merged: list[BomListEntry] = []
@@ -241,6 +243,20 @@ def _cap_offline(
     )
 
 
+def _is_trustworthy_empty_bom_grid(html: str) -> bool:
+    """True when CRM returned an intentional empty filtered grid.
+
+    Live SystemGroup empty-miss HTML includes ``rgNoRecords`` (Persian
+    \"سطری برای نمایش وجود ندارد.\") and no ``rgRow`` / ``rgAltRow`` data
+    rows. A bare empty ``<tbody>`` without that marker stays ambiguous and
+    must still fall through to the catalog walk.
+    """
+    if not html or "rgNoRecords" not in html:
+        return False
+    # Data-row classes are distinct from rgNoRecords (not a substring).
+    return "rgRow" not in html and "rgAltRow" not in html
+
+
 def _load_via_number_startswith(
     sg: SystemGroupClient,
     *,
@@ -260,7 +276,16 @@ def _load_via_number_startswith(
     current = body
     current_ctype = ctype
     while True:
-        page_entries = parse_bom_list_document(current, content_type=current_ctype)
+        try:
+            page_entries = parse_bom_list_document(
+                current, content_type=current_ctype
+            )
+        except SystemGroupParseError:
+            # Path A (trustworthy): CRM empty-miss grid with rgNoRecords.
+            # Return empty so callers raise NoBomMatch — do NOT fall through.
+            if _is_trustworthy_empty_bom_grid(current):
+                break
+            raise
         # CRM already filtered; still apply local StartsWith for safety.
         page_hits = match_number_startswith(page_entries, prefix)
         for entry in page_hits:
@@ -281,8 +306,7 @@ def _load_via_number_startswith(
             break
         current, current_ctype = sg._post_bom_list_next(current, pager)
     # Path B: filter postback succeeded and pages parsed, but nothing StartsWith.
-    # Return empty so callers raise NoBomMatch — do NOT fall through to a full
-    # catalog walk (that catch is for ClientError / ambiguous parse-empty).
+    # (Also path A after rgNoRecords break above.) Empty → NoBomMatch; no walk.
     return BomSearchResult(
         entries=merged,
         truncated=truncated,
