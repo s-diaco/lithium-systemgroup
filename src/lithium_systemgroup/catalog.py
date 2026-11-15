@@ -247,7 +247,7 @@ def _is_trustworthy_empty_bom_grid(html: str) -> bool:
     """True when CRM returned an intentional empty filtered grid.
 
     Live SystemGroup empty-miss HTML includes ``rgNoRecords`` (Persian
-    \"سطری برای نمایش وجود ندارد.\") and no ``rgRow`` / ``rgAltRow`` data
+    «سطری برای نمایش وجود ندارد.») and no ``rgRow`` / ``rgAltRow`` data
     rows. A bare empty ``<tbody>`` without that marker stays ambiguous and
     must still fall through to the catalog walk.
     """
