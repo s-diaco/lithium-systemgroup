@@ -60,7 +60,7 @@ class BomListEntry:
     description: str = ""
     revision: str = ""
     edit_url: str = ""
-    # Raw CRM ``Number`` / «کد BOM» when known (preserves concat forms for StartsWith).
+    # Raw CRM ``Number`` / «کد BOM» when known (preserves concat forms for Contains).
     number: str = ""
 
     def label(self) -> str:
@@ -1070,7 +1070,7 @@ def split_bom_code(raw: str, part_number: str | None = None) -> tuple[str, str]:
     ``/``. Values with no slash and no part_number are the whole PN with an
     empty revision.
 
-    Callers that filter by Number StartsWith (e.g. ``list_revisions_for_part``)
+    Callers that filter by Number Contains (e.g. ``list_revisions_for_part``)
     must pass the user query through unchanged — do not use this helper to
     strip a Part ID at ``/`` before the CRM filter.
     """
@@ -1320,7 +1320,7 @@ def match_bom_list_entries(
         return list(entries)
 
     # Allow callers to pass a full «کد BOM» value (e.g. 1155F229/A2*10-C).
-    # Legacy first-/ split only — not used by list_revisions_for_part StartsWith.
+    # Legacy first-/ split only — not used by list_revisions_for_part Contains.
     query_pn, query_rev = split_bom_code(raw_pn)
     if query_rev and not rev:
         pn = query_pn.casefold()

@@ -9,6 +9,7 @@ from .catalog import (
     entry_bom_number,
     list_revisions_for_part,
     load_bom_list_entries,
+    match_number_contains,
     match_number_startswith,
     resolve_bom_from_list,
 )
@@ -96,6 +97,7 @@ __all__ = [
     "list_revisions_for_part",
     "load_bom_list_entries",
     "match_bom_list_entries",
+    "match_number_contains",
     "match_number_startswith",
     "normalize_crm_decimal",
     "normalize_order_quantity",
@@ -112,4 +114,4 @@ __all__ = [
     "unicode_correct_invalid_characters",
 ]
 
-__version__ = "0.2.7"
+__version__ = "0.2.8"

@@ -43,7 +43,7 @@ _BOM_LIST_UPDATE_PANEL_ID = "innerUpdatePanel"
 _BOM_LIST_OUTER_UPDATE_PANEL_ID = "updatePanel"
 _BOM_LIST_GRID_UNIQUE_ID = "lstEntities$Grid"
 _BOM_LIST_TABLE_UNIQUE_ID = "lstEntities$Grid$MasterTableView"
-# کد BOM (Number) Supports StartsWith on PN or PN/rev prefixes.
+# کد BOM (Number) Supports Contains / StartsWith on PN or PN/rev queries.
 _NUMBER_TEXTBOX_NAME = re.compile(
     r'name="(lstEntities\$Grid\$MasterTableView\$[^"]*SgTextBox_Number)"'
 )
@@ -746,11 +746,11 @@ class SystemGroupClient:
     ) -> tuple[str, str]:
         """Async-post Number/PartCode column filter; return merged HTML.
 
-        Default: ``Number`` + ``StartsWith`` so prefixes like ``2183S509``,
-        ``2183S509/A63*2``, and the full ``کد BOM`` all hit. ``PartCode`` is
-        PN-only and cannot match slash-prefix queries. Posts
-        ``FireCommand:<MasterTableView>;Filter;<column>|?<value>|?<fn>`` against
-        the outer ``updatePanel`` (not ``innerUpdatePanel``).
+        Default: ``Number`` + ``StartsWith``. Load revisions uses ``Contains``
+        so mid-string Part IDs (``4762`` → ``APO4762``) hit; prefixes remain a
+        subset. ``PartCode`` is PN-only and cannot match slash-prefix queries.
+        Posts ``FireCommand:<MasterTableView>;Filter;<column>|?<value>|?<fn>``
+        against the outer ``updatePanel`` (not ``innerUpdatePanel``).
         """
         pn = (part_code or "").strip()
         if not pn:

@@ -9,10 +9,12 @@ from unittest import mock
 
 from lithium_systemgroup import (
     AmbiguousBomMatch,
+    BomListEntry,
     BomSearchResult,
     NoBomMatch,
     SystemGroupClient,
     SystemGroupClientError,
+    SystemGroupError,
     SystemGroupParseError,
     __version__,
     bi_to_hex,
@@ -31,6 +33,7 @@ from lithium_systemgroup import (
     list_revisions_for_part,
     load_bom_list_entries,
     match_bom_list_entries,
+    match_number_contains,
     match_number_startswith,
     normalize_crm_decimal,
     normalize_order_quantity,
@@ -239,7 +242,7 @@ class BomListParseTests(unittest.TestCase):
         self.assertEqual(missing_concat.revision, "")
 
     def test_match_number_startswith_keeps_concat_and_slash(self):
-        """Offline StartsWith uses raw Number; slash prefix is not stripped."""
+        """Offline StartsWith helper still uses raw Number; slash not stripped."""
         raw = (FIXTURES / "bom_list_telerik.json").read_text(encoding="utf-8")
         entries = parse_bom_list_document(raw, content_type="application/json")
         slash_hits = match_number_startswith(entries, "1155F229/")
@@ -251,6 +254,37 @@ class BomListParseTests(unittest.TestCase):
         html_entries = parse_bom_list_document(html, content_type="text/html")
         precise = match_number_startswith(html_entries, "500-9001-00/1")
         self.assertEqual([e.bom_id for e in precise], ["39477"])
+
+    def test_match_number_contains_mid_string_and_prefix(self):
+        """Contains finds mid-string Part IDs; prefix remains a subset."""
+        entries = [
+            BomListEntry(
+                bom_id="1",
+                part_number="APO4762",
+                number="APO4762",
+                revision="A",
+            ),
+            BomListEntry(
+                bom_id="2",
+                part_number="APO4762",
+                number="APO4762/B",
+                revision="B",
+            ),
+            BomListEntry(
+                bom_id="3",
+                part_number="OTHER",
+                number="ZZZ9999",
+                revision="",
+            ),
+        ]
+        mid = match_number_contains(entries, "4762")
+        self.assertEqual([e.bom_id for e in mid], ["1", "2"])
+        prefix = match_number_contains(entries, "APO4762")
+        self.assertEqual([e.bom_id for e in prefix], ["1", "2"])
+        # Strict StartsWith still misses the mid-string query.
+        self.assertEqual(match_number_startswith(entries, "4762"), [])
+        miss = match_number_contains(entries, "NOPE")
+        self.assertEqual(miss, [])
 
     def test_match_narrows_ambiguous_pn_with_revision(self):
         entries = parse_bom_list_document(
@@ -286,20 +320,60 @@ class BomListParseTests(unittest.TestCase):
         self.assertEqual({r.part_number for r in result.entries}, {"500-9001-00"})
         self.assertFalse(result.truncated)
 
-    def test_list_revisions_startswith_prefix_and_cap(self):
-        """Slash prefixes match Number StartsWith; cap sets truncated."""
+    def test_list_revisions_contains_mid_string_prefix_and_cap(self):
+        """Mid-string Contains, prefix subset, miss, and truncation."""
+        entries = [
+            BomListEntry(
+                bom_id="10",
+                part_number="APO4762",
+                number="APO4762",
+                revision="A",
+            ),
+            BomListEntry(
+                bom_id="11",
+                part_number="APO4762",
+                number="APO4762/B",
+                revision="B",
+            ),
+            BomListEntry(
+                bom_id="12",
+                part_number="PRE4762X",
+                number="PRE4762X",
+                revision="",
+            ),
+            BomListEntry(
+                bom_id="99",
+                part_number="OTHER",
+                number="ZZZ9999",
+                revision="",
+            ),
+        ]
+        mid = list_revisions_for_part("4762", entries=entries)
+        self.assertEqual({e.bom_id for e in mid.entries}, {"10", "11", "12"})
+        self.assertFalse(mid.truncated)
+        prefix = list_revisions_for_part("APO4762", entries=entries)
+        self.assertEqual({e.bom_id for e in prefix.entries}, {"10", "11"})
+        with self.assertRaises(NoBomMatch):
+            list_revisions_for_part("NOPE", entries=entries)
+        with self.assertRaises(SystemGroupError):
+            list_revisions_for_part("   ", entries=entries)
+        capped = list_revisions_for_part("4762", entries=entries, max_results=2)
+        self.assertEqual(len(capped.entries), 2)
+        self.assertTrue(capped.truncated)
+        self.assertEqual(capped.max_results, 2)
+
         html = (FIXTURES / "bom_list.html").read_text(encoding="utf-8")
         full = list_revisions_for_part("500-9001-00/1", list_html=html)
         self.assertEqual([e.bom_id for e in full.entries], ["39477"])
         self.assertFalse(full.truncated)
-        prefix = list_revisions_for_part("500-9001-00/", list_html=html)
-        self.assertEqual({e.bom_id for e in prefix.entries}, {"39477", "40001"})
-        capped = list_revisions_for_part(
+        prefix_slash = list_revisions_for_part("500-9001-00/", list_html=html)
+        self.assertEqual({e.bom_id for e in prefix_slash.entries}, {"39477", "40001"})
+        capped_fixture = list_revisions_for_part(
             "500-9001-00", list_html=html, max_results=1
         )
-        self.assertEqual(len(capped.entries), 1)
-        self.assertTrue(capped.truncated)
-        self.assertEqual(capped.max_results, 1)
+        self.assertEqual(len(capped_fixture.entries), 1)
+        self.assertTrue(capped_fixture.truncated)
+        self.assertEqual(capped_fixture.max_results, 1)
 
 
 class ClientTests(unittest.TestCase):
@@ -559,8 +633,8 @@ class ClientTests(unittest.TestCase):
         ids = [e.bom_id for e in entries]
         self.assertEqual(ids, ["39477", "40001", "41000", "42000"])
 
-    def test_list_revisions_uses_number_startswith_filter_postback(self):
-        """Load revisions prefers Number StartsWith filter over a full catalog walk."""
+    def test_list_revisions_uses_number_contains_filter_postback(self):
+        """Load revisions prefers Number Contains filter over a full catalog walk."""
         login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
         page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
         # Inject Number filter textbox the live CRM list exposes.
@@ -625,7 +699,7 @@ class ClientTests(unittest.TestCase):
         posted = filter_call.kwargs.get("data") or filter_call.args[1]
         self.assertEqual(posted["__EVENTTARGET"], "lstEntities$Grid")
         self.assertIn(
-            "FireCommand:lstEntities$Grid$MasterTableView;Filter;Number|?500-9001-00|?StartsWith",
+            "FireCommand:lstEntities$Grid$MasterTableView;Filter;Number|?500-9001-00|?Contains",
             posted["__EVENTARGUMENT"],
         )
         self.assertEqual(posted["scriptManager"], "updatePanel|lstEntities$Grid")
@@ -634,8 +708,8 @@ class ClientTests(unittest.TestCase):
             "500-9001-00",
         )
 
-    def test_list_revisions_startswith_keeps_slash_prefix(self):
-        """Part ID with '/' is posted as Number StartsWith — not split_bom_code'd."""
+    def test_list_revisions_contains_keeps_slash_prefix(self):
+        """Part ID with '/' is posted as Number Contains — not split_bom_code'd."""
         login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
         page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
         page1 = page1.replace(
@@ -695,7 +769,7 @@ class ClientTests(unittest.TestCase):
         filter_call = session.post.call_args_list[1]
         posted = filter_call.kwargs.get("data") or filter_call.args[1]
         self.assertIn(
-            "FireCommand:lstEntities$Grid$MasterTableView;Filter;Number|?500-9001-00/|?StartsWith",
+            "FireCommand:lstEntities$Grid$MasterTableView;Filter;Number|?500-9001-00/|?Contains",
             posted["__EVENTARGUMENT"],
         )
         self.assertEqual(
@@ -704,7 +778,7 @@ class ClientTests(unittest.TestCase):
         )
 
     def test_list_revisions_filter_zero_matches_skips_catalog_fallback(self):
-        """Path B: parseable filter page, zero Number StartsWith → NoBomMatch, no walk."""
+        """Path B: parseable filter page, zero Number Contains → NoBomMatch, no walk."""
         login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
         page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
         page1 = page1.replace(
@@ -714,7 +788,7 @@ class ClientTests(unittest.TestCase):
             'type="text" value="" />'
             '<input type="hidden" name="__EVENTVALIDATION"',
         )
-        # CRM "filtered" page still has rows, but none StartsWith the query.
+        # CRM "filtered" page still has rows, but none Contains the query.
         filtered = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
         filtered = filtered.replace(
             '<li class="rtbItem rtbBtn">'
@@ -877,7 +951,7 @@ class ClientTests(unittest.TestCase):
             headers={"Content-Type": "text/plain"},
         )
         filter_post.raise_for_status = mock.Mock()
-        # Fallback walk: page1 hits then page2 miss → cluster early-exit.
+        # Fallback walk: page1 hits, page2 has no Contains hits; pager ends.
         page2 = (FIXTURES / "bom_list_page2.html").read_text(encoding="utf-8")
         next_post = mock.Mock(
             status_code=200,
@@ -896,16 +970,14 @@ class ClientTests(unittest.TestCase):
         # login + filter + one fallback Next (not a blind empty miss).
         self.assertEqual(session.post.call_count, 3)
 
-    def test_list_revisions_stops_after_part_cluster(self):
-        """Load revisions must not walk pages after the part-id hit cluster ends."""
+    def test_list_revisions_fallback_walk_pages_until_cap_or_end(self):
+        """Contains fallback walk keeps paging past miss pages (no StartsWith cluster exit)."""
         login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
         page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
         # Mid page: no 500-9001-00 hits, but Next still enabled (3-page catalog).
-        # Without early-exit, iter would keep posting through page3+.
         page2 = (
             (FIXTURES / "bom_list_page2.html")
             .read_text(encoding="utf-8")
-            .replace("صفحه2", "صفحه2")
             .replace(
                 '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
                 '<li class="rcbItem ">صفحه2</li></ul>',
@@ -926,9 +998,17 @@ class ClientTests(unittest.TestCase):
                 '<a title="انتها" class="rtbWrap" href="#"><span>Last</span></a></li>',
             )
         )
-        page3 = page2.replace("صفحه2", "صفحه3").replace("ev-page2", "ev-page3")
-        page3 = page3.replace("41,000", "51,000").replace("41000", "51000")
-        page3 = page3.replace("42,000", "52,000").replace("42000", "52000")
+        # page3: Next disabled (end of catalog).
+        page3 = (
+            (FIXTURES / "bom_list_page2.html")
+            .read_text(encoding="utf-8")
+            .replace("صفحه2", "صفحه3")
+            .replace("ev-page2", "ev-page3")
+            .replace("41,000", "51,000")
+            .replace("41000", "51000")
+            .replace("42,000", "52,000")
+            .replace("42000", "52000")
+        )
         session = mock.Mock()
         login_get = mock.Mock(
             status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
@@ -959,8 +1039,7 @@ class ClientTests(unittest.TestCase):
             headers={"Content-Type": "text/html"},
         )
         page3_post.raise_for_status = mock.Mock()
-        # PartCode filter is attempted first (no textbox → fails), then cluster walk.
-        # fetch_bom_list may try framed + fallback URLs; allow extra list GETs.
+        # Number filter fails → full Contains walk. Extra list GETs allowed.
         session.get.side_effect = [login_get] + [list_get] * 6
         session.post.side_effect = [login_post, next_post, page3_post]
         client = SystemGroupClient(
@@ -973,9 +1052,8 @@ class ClientTests(unittest.TestCase):
         ):
             result = list_revisions_for_part("500-9001-00", client=client)
         self.assertEqual({r.bom_id for r in result.entries}, {"39477", "40001"})
-        # Fallback walk: login POST + Next pages until prefix hits stop appearing.
-        # page1 hits, page2 miss → stop (never page3).
-        self.assertEqual(session.post.call_count, 2)
+        # login + Next to page2 + Next to page3 (Contains does not stop on miss page).
+        self.assertEqual(session.post.call_count, 3)
 
     def test_customer_orders_report_url_uses_base(self):
         url = customer_orders_report_url("http://crm.example/", "ReportViewer.aspx?x=1")
