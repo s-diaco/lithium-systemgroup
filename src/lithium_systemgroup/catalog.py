@@ -48,7 +48,7 @@ class NoBomMatch(SystemGroupError):
 
 @dataclass
 class BomSearchResult:
-    """Capped Part ID search result (CRM Number StartsWith)."""
+    """Capped Part ID search result (CRM Number Contains)."""
 
     entries: list[BomListEntry] = field(default_factory=list)
     truncated: bool = False
@@ -66,7 +66,7 @@ def entry_bom_number(entry: BomListEntry) -> str:
     """CRM ``Number`` / کد BOM value for a list row.
 
     Prefers the raw ``number`` field when present so concatenated forms
-    (e.g. ``2183S914*2-C``) stay exact for Number StartsWith matching.
+    (e.g. ``2183S914*2-C``) stay exact for Number Contains matching.
     Falls back to ``PN/rev`` reconstruction.
     """
     raw = (entry.number or "").strip()
@@ -79,10 +79,43 @@ def entry_bom_number(entry: BomListEntry) -> str:
     return pn
 
 
+def _entry_match_haystacks(entry: BomListEntry) -> list[str]:
+    """Casefolded strings to search for a Part ID query (Number + کد کالا PN)."""
+    haystacks: list[str] = []
+    number = entry_bom_number(entry).casefold()
+    if number:
+        haystacks.append(number)
+    pn = (entry.part_number or "").strip().casefold()
+    if pn and pn not in haystacks:
+        haystacks.append(pn)
+    return haystacks
+
+
+def match_number_contains(
+    entries: list[BomListEntry], query: str
+) -> list[BomListEntry]:
+    """Keep rows whose CRM Number or Part ID contains ``query`` (case-insensitive).
+
+    Prefix matches are a subset of contains (``4762`` finds ``APO4762``).
+    """
+    needle = (query or "").strip().casefold()
+    if not needle:
+        return list(entries)
+    out: list[BomListEntry] = []
+    for entry in entries:
+        if any(needle in hay for hay in _entry_match_haystacks(entry)):
+            out.append(entry)
+    return out
+
+
 def match_number_startswith(
     entries: list[BomListEntry], prefix: str
 ) -> list[BomListEntry]:
-    """Keep rows whose CRM Number starts with ``prefix`` (case-insensitive)."""
+    """Keep rows whose CRM Number starts with ``prefix`` (case-insensitive).
+
+    Retained for callers that need strict prefix; Load revisions uses
+    :func:`match_number_contains`.
+    """
     needle = (prefix or "").strip().casefold()
     if not needle:
         return list(entries)
@@ -109,9 +142,9 @@ def load_bom_list_entries(
 
     Live fetch shortcuts (avoid walking the full catalog):
 
-    - ``filter_prefix``: Number header ``StartsWith`` filter postback (Part ID
+    - ``filter_prefix``: Number header ``Contains`` filter postback (Part ID
       search). Stops paging once ``max_results`` is reached when set.
-    - ``stop_part_number`` alone (legacy): same Number StartsWith path when
+    - ``stop_part_number`` alone (legacy): same Number Contains path when
       ``filter_prefix`` is unset.
     - ``stop_part_number`` + ``stop_revision``: stop on the first page that
       contains that exact BoM code (unique PN/rev resolve).
@@ -167,26 +200,27 @@ def _load_bom_list_entries(
         if not prefix and stop_pn and not stop_rev:
             prefix = stop_pn
 
-        # Prefer CRM Number StartsWith for Part ID loads.
+        # Prefer CRM Number Contains for Part ID loads.
         if prefix and not stop_rev:
             try:
-                return _load_via_number_startswith(
-                    sg, prefix=prefix, max_results=cap
+                return _load_via_number_contains(
+                    sg, query=prefix, max_results=cap
                 )
             except (SystemGroupClientError, SystemGroupParseError):
                 # Fall through only for ClientError / ambiguous parse-empty
                 # (no rgNoRecords). Trustworthy empty is handled inside
-                # _load_via_number_startswith and never reaches here.
+                # _load_via_number_contains and never reaches here.
                 pass
 
         merged: list[BomListEntry] = []
         seen: set[str] = set()
         truncated = False
-        seen_prefix_hits = False
         for body, ctype in sg.iter_bom_list_pages():
             page_entries = parse_bom_list_document(body, content_type=ctype)
             if prefix and not stop_rev:
-                page_hits = match_number_startswith(page_entries, prefix)
+                # Contains hits are not clustered on ID-desc Number sort —
+                # keep paging until cap or end of catalog.
+                page_hits = match_number_contains(page_entries, prefix)
                 for entry in page_hits:
                     if entry.bom_id in seen:
                         continue
@@ -196,11 +230,6 @@ def _load_bom_list_entries(
                     seen.add(entry.bom_id)
                     merged.append(entry)
                 if truncated:
-                    break
-                if page_hits:
-                    seen_prefix_hits = True
-                elif seen_prefix_hits:
-                    # Hit cluster ended (ID-desc list); stop paging.
                     break
                 continue
             for entry in page_entries:
@@ -235,7 +264,7 @@ def _cap_offline(
     query: str,
     max_results: int | None,
 ) -> BomSearchResult:
-    matched = match_number_startswith(rows, query) if query else list(rows)
+    matched = match_number_contains(rows, query) if query else list(rows)
     if max_results is None or len(matched) <= max_results:
         return BomSearchResult(
             entries=matched,
@@ -265,18 +294,18 @@ def _is_trustworthy_empty_bom_grid(html: str) -> bool:
     return "rgRow" not in html and "rgAltRow" not in html
 
 
-def _load_via_number_startswith(
+def _load_via_number_contains(
     sg: SystemGroupClient,
     *,
-    prefix: str,
+    query: str,
     max_results: int | None,
 ) -> BomSearchResult:
-    """Filter by Number StartsWith, page until cap, report truncation."""
+    """Filter by Number Contains, page until cap, report truncation."""
     if not sg._logged_in:
         sg.login()
     body, ctype = sg.fetch_bom_list()
     body, ctype = sg._post_bom_list_part_code_filter(
-        body, prefix, filter_function="StartsWith", column="Number"
+        body, query, filter_function="Contains", column="Number"
     )
     merged: list[BomListEntry] = []
     seen: set[str] = set()
@@ -294,8 +323,8 @@ def _load_via_number_startswith(
             if _is_trustworthy_empty_bom_grid(current):
                 break
             raise
-        # CRM already filtered; still apply local StartsWith for safety.
-        page_hits = match_number_startswith(page_entries, prefix)
+        # CRM already filtered; still apply local Contains for safety.
+        page_hits = match_number_contains(page_entries, query)
         for entry in page_hits:
             if entry.bom_id in seen:
                 continue
@@ -313,12 +342,12 @@ def _load_via_number_startswith(
             truncated = True
             break
         current, current_ctype = sg._post_bom_list_next(current, pager)
-    # Path B: filter postback succeeded and pages parsed, but nothing StartsWith.
+    # Path B: filter postback succeeded and pages parsed, but nothing Contains.
     # (Also path A after rgNoRecords break above.) Empty → NoBomMatch; no walk.
     return BomSearchResult(
         entries=merged,
         truncated=truncated,
-        query=prefix,
+        query=query,
         max_results=max_results,
     )
 
@@ -333,7 +362,7 @@ def list_revisions_for_part(
     entries: list[BomListEntry] | None = None,
     max_results: int | None = DEFAULT_MAX_RESULTS,
 ) -> BomSearchResult:
-    """Return CRM BoM list rows whose Number StartsWith the Part ID query.
+    """Return CRM BoM list rows whose Number/Part ID contains the query.
 
     Pass the user input as-is (including ``PN/rev`` prefixes). Does not strip
     at ``/``. Caps at ``max_results`` (default 10); ``truncated`` is set when
