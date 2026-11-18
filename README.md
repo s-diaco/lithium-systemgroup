@@ -72,7 +72,7 @@ Never commit credentials. Prefer a gitignored env file or the process environmen
 
 | Module | Role |
 |--------|------|
-| `client` | ASP.NET forms-auth session; fetch BoM list / edit; export customer-orders CSV |
+| `client` | ASP.NET forms-auth session; fetch BoM list / edit (list paging uses Shell-framed List.aspx + async Next); export customer-orders CSV |
 | `parser` | Login form, BoM edit/list HTML/JSON, customer-orders CSV |
 | `rsa_login` | CRM RSA password hashing used by Login.aspx |
 | `catalog` | List load + match helpers (`list_revisions_for_part`, `resolve_bom_from_list`) |

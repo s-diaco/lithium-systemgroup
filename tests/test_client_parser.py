@@ -9,10 +9,12 @@ from unittest import mock
 
 from lithium_systemgroup import (
     AmbiguousBomMatch,
+    BomSearchResult,
     NoBomMatch,
     SystemGroupClient,
     SystemGroupClientError,
     SystemGroupParseError,
+    __version__,
     bi_to_hex,
     bom_edit_direct_url,
     bom_edit_url,
@@ -23,11 +25,13 @@ from lithium_systemgroup import (
     deterministic_randbelow,
     digit_size_for_modulus,
     encrypted_string,
+    entry_bom_number,
     extract_bom_id_from_url,
     extract_export_url_base,
     list_revisions_for_part,
     load_bom_list_entries,
     match_bom_list_entries,
+    match_number_startswith,
     normalize_crm_decimal,
     normalize_order_quantity,
     parse_bom_document,
@@ -148,6 +152,10 @@ class BomParseTests(unittest.TestCase):
 
 
 class BomListParseTests(unittest.TestCase):
+    def test_public_api_exports_bom_search_result(self):
+        self.assertTrue(issubclass(BomSearchResult, object))
+        self.assertRegex(__version__, r"^0\.2\.[7-9]|^0\.[3-9]")
+
     def test_split_bom_code(self):
         # Legacy: no کد کالا — first-/ or whole string.
         self.assertEqual(split_bom_code("1155F229/A2*10-C"), ("1155F229", "A2*10-C"))
@@ -187,6 +195,8 @@ class BomListParseTests(unittest.TestCase):
         concat = by_id["39482"]
         self.assertEqual(concat.part_number, "2183S914")
         self.assertEqual(concat.revision, "*2-C")
+        self.assertEqual(concat.number, "2183S914*2-C")
+        self.assertEqual(entry_bom_number(concat), "2183S914*2-C")
         # Number equals PartCode → empty revision.
         bare = by_id["39484"]
         self.assertEqual(bare.part_number, "CGM5883")
@@ -228,6 +238,20 @@ class BomListParseTests(unittest.TestCase):
         self.assertEqual(missing_concat.part_number, "2183S914*2-C")
         self.assertEqual(missing_concat.revision, "")
 
+    def test_match_number_startswith_keeps_concat_and_slash(self):
+        """Offline StartsWith uses raw Number; slash prefix is not stripped."""
+        raw = (FIXTURES / "bom_list_telerik.json").read_text(encoding="utf-8")
+        entries = parse_bom_list_document(raw, content_type="application/json")
+        slash_hits = match_number_startswith(entries, "1155F229/")
+        self.assertEqual([e.bom_id for e in slash_hits], ["39485"])
+        concat_hits = match_number_startswith(entries, "2183S914*")
+        self.assertEqual([e.bom_id for e in concat_hits], ["39482"])
+        # Extra rows must not appear for a precise slash prefix.
+        html = (FIXTURES / "bom_list.html").read_text(encoding="utf-8")
+        html_entries = parse_bom_list_document(html, content_type="text/html")
+        precise = match_number_startswith(html_entries, "500-9001-00/1")
+        self.assertEqual([e.bom_id for e in precise], ["39477"])
+
     def test_match_narrows_ambiguous_pn_with_revision(self):
         entries = parse_bom_list_document(
             (FIXTURES / "bom_list.html").read_text(encoding="utf-8")
@@ -254,11 +278,28 @@ class BomListParseTests(unittest.TestCase):
         self.assertEqual(len(ctx.exception.matches), 2)
 
     def test_list_revisions_for_part(self):
-        rows = list_revisions_for_part(
+        result = list_revisions_for_part(
             "500-9001-00", list_path=FIXTURES / "bom_list.json"
         )
-        self.assertGreaterEqual(len(rows), 2)
-        self.assertEqual({r.part_number for r in rows}, {"500-9001-00"})
+        self.assertIsInstance(result, BomSearchResult)
+        self.assertGreaterEqual(len(result.entries), 2)
+        self.assertEqual({r.part_number for r in result.entries}, {"500-9001-00"})
+        self.assertFalse(result.truncated)
+
+    def test_list_revisions_startswith_prefix_and_cap(self):
+        """Slash prefixes match Number StartsWith; cap sets truncated."""
+        html = (FIXTURES / "bom_list.html").read_text(encoding="utf-8")
+        full = list_revisions_for_part("500-9001-00/1", list_html=html)
+        self.assertEqual([e.bom_id for e in full.entries], ["39477"])
+        self.assertFalse(full.truncated)
+        prefix = list_revisions_for_part("500-9001-00/", list_html=html)
+        self.assertEqual({e.bom_id for e in prefix.entries}, {"39477", "40001"})
+        capped = list_revisions_for_part(
+            "500-9001-00", list_html=html, max_results=1
+        )
+        self.assertEqual(len(capped.entries), 1)
+        self.assertTrue(capped.truncated)
+        self.assertEqual(capped.max_results, 1)
 
 
 class ClientTests(unittest.TestCase):
@@ -336,7 +377,65 @@ class ClientTests(unittest.TestCase):
             pager.pager_target,
             "lstEntities$Grid$MasterTableView$ctl03$ctl02$Pager",
         )
+        self.assertEqual(pager.next_argument, "3")
         self.assertEqual(pager.fields.get("__EVENTVALIDATION"), "ev-page1")
+
+    def test_parse_pager_next_argument_from_itemdata(self):
+        from lithium_systemgroup import parse_pager_next_argument
+
+        html = (
+            '<div class="EntityListPaging"></div>'
+            r'<script>$create({"itemData":[{"value":"First"},{"value":"Previous"},'
+            r'{"value":"Pages","templated":true},{"value":"Next"},{"value":"Last"}]});'
+            "</script>"
+        )
+        self.assertEqual(parse_pager_next_argument(html), "3")
+
+    def test_strip_clientstate_updated(self):
+        from lithium_systemgroup import strip_clientstate_updated
+
+        fields = {
+            "a": '{"x":1,"__Updated":true}',
+            "b": '{"__Updated":true}',
+            "c": "plain",
+        }
+        out = strip_clientstate_updated(fields)
+        self.assertEqual(out["a"], '{"x":1}')
+        self.assertEqual(out["b"], "{}")
+        self.assertEqual(out["c"], "plain")
+
+    def test_apply_bom_list_async_delta_keeps_pager_target(self):
+        from lithium_systemgroup import apply_bom_list_async_delta
+
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        panel = (
+            '<span id="lstEntities"><div class="EntityListPaging">'
+            '<input id="x_cboPage_Input" value="صفحه2" />'
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+            '<li class="rcbItem ">صفحه2</li></ul>'
+            '<li class="rtbItem rtbBtn"><a title="بعدی" href="#"></a></li>'
+            "</div>"
+            '<table class="rgMasterTable"><tr class="rgRow"><td>1</td></tr></table>'
+            "</span>"
+        )
+        delta = (
+            "1|#||4|"
+            f"{len(panel)}|updatePanel|innerUpdatePanel|{panel}"
+            "|0|hiddenField|__EVENTTARGET|"
+            "|0|hiddenField|__EVENTARGUMENT|"
+            "|0|hiddenField|__VIEWSTATE|"
+            "|11|hiddenField|__EVENTVALIDATION|ev-page2-xx"
+        )
+        merged = apply_bom_list_async_delta(page1, delta)
+        pager = parse_bom_list_pager(merged)
+        self.assertIsNotNone(pager)
+        assert pager is not None
+        self.assertEqual(pager.current_page, 2)
+        self.assertEqual(
+            pager.pager_target,
+            "lstEntities$Grid$MasterTableView$ctl03$ctl02$Pager",
+        )
+        self.assertEqual(pager.fields.get("__EVENTVALIDATION"), "ev-page2-xx")
 
     def test_parse_bom_list_pager_unicode_escaped_quotes(self):
         # Live CRM $create blobs use \u0027 instead of raw quotes.
@@ -412,12 +511,17 @@ class ClientTests(unittest.TestCase):
         # Second session.post is the pager Next (after login post).
         next_call = session.post.call_args_list[1]
         posted = next_call.kwargs.get("data") or next_call.args[1]
+        headers = next_call.kwargs.get("headers") or {}
         self.assertEqual(
             posted["__EVENTTARGET"],
             "lstEntities$Grid$MasterTableView$ctl03$ctl02$Pager",
         )
-        self.assertEqual(posted["__EVENTARGUMENT"], "Next")
+        # Live CRM RadToolBar posts the Next item index, not the string "Next".
+        self.assertEqual(posted["__EVENTARGUMENT"], "3")
+        self.assertEqual(posted["__ASYNCPOST"], "true")
+        self.assertIn("innerUpdatePanel|", posted["scriptManager"])
         self.assertEqual(posted["__EVENTVALIDATION"], "ev-page1")
+        self.assertEqual(headers.get("X-MicrosoftAjax"), "Delta=true")
 
     def test_load_bom_list_entries_merges_pages(self):
         login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
@@ -454,6 +558,424 @@ class ClientTests(unittest.TestCase):
         entries = load_bom_list_entries(client=client)
         ids = [e.bom_id for e in entries]
         self.assertEqual(ids, ["39477", "40001", "41000", "42000"])
+
+    def test_list_revisions_uses_number_startswith_filter_postback(self):
+        """Load revisions prefers Number StartsWith filter over a full catalog walk."""
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        # Inject Number filter textbox the live CRM list exposes.
+        page1 = page1.replace(
+            '<input type="hidden" name="__EVENTVALIDATION"',
+            '<input id="lstEntities_Grid_MasterTableView_ctl02_ctl03_SgTextBox_Number" '
+            'name="lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number" '
+            'type="text" value="" />'
+            '<input type="hidden" name="__EVENTVALIDATION"',
+        )
+        # Filtered async delta: matching rows only; Next disabled (single page).
+        filtered = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        filtered = filtered.replace(
+            '<li class="rtbItem rtbBtn">'
+            '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+            '<li class="rtbItem rtbBtn rtbDisabled">'
+            '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+        ).replace(
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+            '<li class="rcbItem ">صفحه2</li></ul>',
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li></ul>',
+        )
+        delta = (
+            "1|#||4|"
+            f"{len(filtered)}|updatePanel|updatePanel|{filtered}"
+            "|0|hiddenField|__EVENTTARGET||0|hiddenField|__EVENTARGUMENT|"
+        )
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        filter_post = mock.Mock(
+            status_code=200,
+            text=delta,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/plain"},
+        )
+        filter_post.raise_for_status = mock.Mock()
+        session.get.side_effect = [login_get, list_get]
+        session.post.side_effect = [login_post, filter_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        result = list_revisions_for_part("500-9001-00", client=client)
+        self.assertEqual({r.bom_id for r in result.entries}, {"39477", "40001"})
+        self.assertFalse(result.truncated)
+        # login POST + Number filter POST — never pager Next.
+        self.assertEqual(session.post.call_count, 2)
+        filter_call = session.post.call_args_list[1]
+        posted = filter_call.kwargs.get("data") or filter_call.args[1]
+        self.assertEqual(posted["__EVENTTARGET"], "lstEntities$Grid")
+        self.assertIn(
+            "FireCommand:lstEntities$Grid$MasterTableView;Filter;Number|?500-9001-00|?StartsWith",
+            posted["__EVENTARGUMENT"],
+        )
+        self.assertEqual(posted["scriptManager"], "updatePanel|lstEntities$Grid")
+        self.assertEqual(
+            posted["lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number"],
+            "500-9001-00",
+        )
+
+    def test_list_revisions_startswith_keeps_slash_prefix(self):
+        """Part ID with '/' is posted as Number StartsWith — not split_bom_code'd."""
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        page1 = page1.replace(
+            '<input type="hidden" name="__EVENTVALIDATION"',
+            '<input id="lstEntities_Grid_MasterTableView_ctl02_ctl03_SgTextBox_Number" '
+            'name="lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number" '
+            'type="text" value="" />'
+            '<input type="hidden" name="__EVENTVALIDATION"',
+        )
+        filtered = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        filtered = filtered.replace(
+            '<li class="rtbItem rtbBtn">'
+            '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+            '<li class="rtbItem rtbBtn rtbDisabled">'
+            '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+        ).replace(
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+            '<li class="rcbItem ">صفحه2</li></ul>',
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li></ul>',
+        )
+        delta = (
+            "1|#||4|"
+            f"{len(filtered)}|updatePanel|updatePanel|{filtered}"
+            "|0|hiddenField|__EVENTTARGET||0|hiddenField|__EVENTARGUMENT|"
+        )
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        filter_post = mock.Mock(
+            status_code=200,
+            text=delta,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/plain"},
+        )
+        filter_post.raise_for_status = mock.Mock()
+        session.get.side_effect = [login_get, list_get]
+        session.post.side_effect = [login_post, filter_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        result = list_revisions_for_part("500-9001-00/", client=client)
+        self.assertIsInstance(result, BomSearchResult)
+        self.assertEqual(result.query, "500-9001-00/")
+        filter_call = session.post.call_args_list[1]
+        posted = filter_call.kwargs.get("data") or filter_call.args[1]
+        self.assertIn(
+            "FireCommand:lstEntities$Grid$MasterTableView;Filter;Number|?500-9001-00/|?StartsWith",
+            posted["__EVENTARGUMENT"],
+        )
+        self.assertEqual(
+            posted["lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number"],
+            "500-9001-00/",
+        )
+
+    def test_list_revisions_filter_zero_matches_skips_catalog_fallback(self):
+        """Path B: parseable filter page, zero Number StartsWith → NoBomMatch, no walk."""
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        page1 = page1.replace(
+            '<input type="hidden" name="__EVENTVALIDATION"',
+            '<input id="lstEntities_Grid_MasterTableView_ctl02_ctl03_SgTextBox_Number" '
+            'name="lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number" '
+            'type="text" value="" />'
+            '<input type="hidden" name="__EVENTVALIDATION"',
+        )
+        # CRM "filtered" page still has rows, but none StartsWith the query.
+        filtered = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        filtered = filtered.replace(
+            '<li class="rtbItem rtbBtn">'
+            '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+            '<li class="rtbItem rtbBtn rtbDisabled">'
+            '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+        ).replace(
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+            '<li class="rcbItem ">صفحه2</li></ul>',
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li></ul>',
+        )
+        delta = (
+            "1|#||4|"
+            f"{len(filtered)}|updatePanel|updatePanel|{filtered}"
+            "|0|hiddenField|__EVENTTARGET||0|hiddenField|__EVENTARGUMENT|"
+        )
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        filter_post = mock.Mock(
+            status_code=200,
+            text=delta,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/plain"},
+        )
+        filter_post.raise_for_status = mock.Mock()
+        # If fallthrough ran, more GETs/POSTs would be consumed — keep side_effect short.
+        session.get.side_effect = [login_get, list_get]
+        session.post.side_effect = [login_post, filter_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        with self.assertRaises(NoBomMatch):
+            list_revisions_for_part("ZZZ-NO-SUCH-PART", client=client)
+        # login POST + Number filter POST only — no catalog Next fallback.
+        self.assertEqual(session.post.call_count, 2)
+        self.assertEqual(session.get.call_count, 2)
+
+    def test_list_revisions_rg_no_records_skips_catalog_fallback(self):
+        """Path A (trustworthy): rgNoRecords empty miss → NoBomMatch, no walk."""
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        page1 = page1.replace(
+            '<input type="hidden" name="__EVENTVALIDATION"',
+            '<input id="lstEntities_Grid_MasterTableView_ctl02_ctl03_SgTextBox_Number" '
+            'name="lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number" '
+            'type="text" value="" />'
+            '<input type="hidden" name="__EVENTVALIDATION"',
+        )
+        # Live CRM empty-miss chrome: rgNoRecords, no rgRow/rgAltRow.
+        empty_grid = (
+            '<form method="post" action="List.aspx">'
+            '<input type="hidden" name="__VIEWSTATE" value="vs" />'
+            '<input id="lstEntities_Grid_MasterTableView_ctl02_ctl03_SgTextBox_Number" '
+            'name="lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number" '
+            'type="text" value="ZZZ-NO-SUCH-PART" />'
+            '<div id="EntityListPaging"></div>'
+            '<table class="rgMasterTable"><thead></thead><tbody>'
+            '<tr class="rgNoRecords"><td colspan="9">'
+            "<div>سطری برای نمایش وجود ندارد.</div></td></tr>"
+            "</tbody></table>"
+            "</form>"
+        )
+        delta = (
+            "1|#||4|"
+            f"{len(empty_grid)}|updatePanel|updatePanel|{empty_grid}"
+            "|0|hiddenField|__EVENTTARGET||0|hiddenField|__EVENTARGUMENT|"
+        )
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        filter_post = mock.Mock(
+            status_code=200,
+            text=delta,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/plain"},
+        )
+        filter_post.raise_for_status = mock.Mock()
+        session.get.side_effect = [login_get, list_get]
+        session.post.side_effect = [login_post, filter_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        with self.assertRaises(NoBomMatch):
+            list_revisions_for_part("ZZZ-NO-SUCH-PART", client=client)
+        # login + filter only — no catalog Next fallback.
+        self.assertEqual(session.post.call_count, 2)
+        self.assertEqual(session.get.call_count, 2)
+
+    def test_list_revisions_ambiguous_empty_filter_still_falls_through(self):
+        """Ambiguous empty (no rgNoRecords) still uses catalog fallback."""
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        page1 = page1.replace(
+            '<input type="hidden" name="__EVENTVALIDATION"',
+            '<input id="lstEntities_Grid_MasterTableView_ctl02_ctl03_SgTextBox_Number" '
+            'name="lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number" '
+            'type="text" value="" />'
+            '<input type="hidden" name="__EVENTVALIDATION"',
+        )
+        # Empty grid chrome without rgNoRecords — parse raises (ambiguous).
+        empty_grid = (
+            '<form method="post" action="List.aspx">'
+            '<input type="hidden" name="__VIEWSTATE" value="vs" />'
+            '<div id="EntityListPaging"></div>'
+            '<table class="rgMasterTable"><thead></thead><tbody></tbody></table>'
+            "</form>"
+        )
+        delta = (
+            "1|#||4|"
+            f"{len(empty_grid)}|updatePanel|updatePanel|{empty_grid}"
+            "|0|hiddenField|__EVENTTARGET||0|hiddenField|__EVENTARGUMENT|"
+        )
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        filter_post = mock.Mock(
+            status_code=200,
+            text=delta,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/plain"},
+        )
+        filter_post.raise_for_status = mock.Mock()
+        # Fallback walk: page1 hits then page2 miss → cluster early-exit.
+        page2 = (FIXTURES / "bom_list_page2.html").read_text(encoding="utf-8")
+        next_post = mock.Mock(
+            status_code=200,
+            text=page2,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        next_post.raise_for_status = mock.Mock()
+        session.get.side_effect = [login_get, list_get] + [list_get] * 6
+        session.post.side_effect = [login_post, filter_post, next_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        result = list_revisions_for_part("500-9001-00", client=client)
+        self.assertEqual({r.bom_id for r in result.entries}, {"39477", "40001"})
+        # login + filter + one fallback Next (not a blind empty miss).
+        self.assertEqual(session.post.call_count, 3)
+
+    def test_list_revisions_stops_after_part_cluster(self):
+        """Load revisions must not walk pages after the part-id hit cluster ends."""
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        # Mid page: no 500-9001-00 hits, but Next still enabled (3-page catalog).
+        # Without early-exit, iter would keep posting through page3+.
+        page2 = (
+            (FIXTURES / "bom_list_page2.html")
+            .read_text(encoding="utf-8")
+            .replace("صفحه2", "صفحه2")
+            .replace(
+                '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+                '<li class="rcbItem ">صفحه2</li></ul>',
+                '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+                '<li class="rcbItem ">صفحه2</li>'
+                '<li class="rcbItem ">صفحه3</li></ul>',
+            )
+            .replace(
+                '<li class="rtbItem rtbBtn rtbDisabled">'
+                '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+                '<li class="rtbItem rtbBtn">'
+                '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+            )
+            .replace(
+                '<li class="rtbItem rtbBtn rtbDisabled">'
+                '<a title="انتها" class="rtbWrap" href="#"><span>Last</span></a></li>',
+                '<li class="rtbItem rtbBtn">'
+                '<a title="انتها" class="rtbWrap" href="#"><span>Last</span></a></li>',
+            )
+        )
+        page3 = page2.replace("صفحه2", "صفحه3").replace("ev-page2", "ev-page3")
+        page3 = page3.replace("41,000", "51,000").replace("41000", "51000")
+        page3 = page3.replace("42,000", "52,000").replace("42000", "52000")
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        next_post = mock.Mock(
+            status_code=200,
+            text=page2,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        next_post.raise_for_status = mock.Mock()
+        page3_post = mock.Mock(
+            status_code=200,
+            text=page3,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        page3_post.raise_for_status = mock.Mock()
+        # PartCode filter is attempted first (no textbox → fails), then cluster walk.
+        # fetch_bom_list may try framed + fallback URLs; allow extra list GETs.
+        session.get.side_effect = [login_get] + [list_get] * 6
+        session.post.side_effect = [login_post, next_post, page3_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        with mock.patch.object(
+            SystemGroupClient,
+            "_post_bom_list_part_code_filter",
+            side_effect=SystemGroupClientError("no filter"),
+        ):
+            result = list_revisions_for_part("500-9001-00", client=client)
+        self.assertEqual({r.bom_id for r in result.entries}, {"39477", "40001"})
+        # Fallback walk: login POST + Next pages until prefix hits stop appearing.
+        # page1 hits, page2 miss → stop (never page3).
+        self.assertEqual(session.post.call_count, 2)
 
     def test_customer_orders_report_url_uses_base(self):
         url = customer_orders_report_url("http://crm.example/", "ReportViewer.aspx?x=1")
