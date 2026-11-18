@@ -63,7 +63,15 @@ class BomSearchResult:
 
 
 def entry_bom_number(entry: BomListEntry) -> str:
-    """CRM ``Number`` / کد BOM value reconstructed from a list row."""
+    """CRM ``Number`` / کد BOM value for a list row.
+
+    Prefers the raw ``number`` field when present so concatenated forms
+    (e.g. ``2183S914*2-C``) stay exact for Number StartsWith matching.
+    Falls back to ``PN/rev`` reconstruction.
+    """
+    raw = (entry.number or "").strip()
+    if raw:
+        return raw
     pn = (entry.part_number or "").strip()
     rev = (entry.revision or "").strip()
     if rev:

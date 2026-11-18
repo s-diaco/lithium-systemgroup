@@ -60,6 +60,8 @@ class BomListEntry:
     description: str = ""
     revision: str = ""
     edit_url: str = ""
+    # Raw CRM ``Number`` / «کد BOM» when known (preserves concat forms for StartsWith).
+    number: str = ""
 
     def label(self) -> str:
         bits = [f"id={self.bom_id}"]
@@ -765,7 +767,7 @@ def parse_bom_document(content: str, content_type: str | None = None) -> ParsedB
 
 _LIST_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
     "bom_id": ("id", "bom id", "bom_id", "bomid", "entity id", "شناسه"),
-    # CRM list column «کد BOM» holds parent_part_number/revision (e.g. 500-9001-00/1).
+    # CRM list column «کد BOM» / Number is PN/rev or concatenated PN+rev.
     "bom_code": (
         "bom code",
         "bom_code",
@@ -774,15 +776,20 @@ _LIST_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
         "کدbom",
         "code bom",
     ),
+    # CRM list column «کد کالا» / PartCode is the part number (not Number).
     "part_number": (
         "part_number",
         "part number",
         "part no",
         "partno",
+        "partcode",
+        "part_code",
         "code",
         "item",
         "item code",
         "شماره قطعه",
+        "کد کالا",
+        "کدکالا",
     ),
     # «عنوان BOM» is the list title; do not map bare «title» alone before this.
     "description": (
@@ -1051,21 +1058,38 @@ def _score_list_table(table: dict[str, Any]) -> int:
     return score
 
 
-def split_bom_code(raw: str) -> tuple[str, str]:
+def split_bom_code(raw: str, part_number: str | None = None) -> tuple[str, str]:
     """Split CRM «کد BOM» (field ``Number``) → (part_number, revision).
 
-    When a ``/`` is present (e.g. ``1155F229/A2*10-C``), the left side is the
-    part number and the remainder is revision. Values without a slash
-    (e.g. ``CGM5883``, ``2183S914*2-C``) are the whole part number with an
+    When ``part_number`` (list column «کد کالا» / ``PartCode``) is given and is
+    a prefix of ``raw``, that value is the PN and the remaining tail (after an
+    optional ``/``) is the revision — covering both ``PN/rev`` and concatenated
+    ``PNrev`` forms (e.g. ``2183S914*2-C`` with PartCode ``2183S914``).
+
+    Without a usable part_number prefix, falls back to splitting on the first
+    ``/``. Values with no slash and no part_number are the whole PN with an
     empty revision.
+
+    Callers that filter by Number StartsWith (e.g. ``list_revisions_for_part``)
+    must pass the user query through unchanged — do not use this helper to
+    strip a Part ID at ``/`` before the CRM filter.
     """
     text = (raw or "").strip()
     if not text:
         return "", ""
+    pn = (part_number or "").strip()
+    if pn:
+        if text.casefold().startswith(pn.casefold()):
+            tail = text[len(pn) :]
+            if tail.startswith("/"):
+                tail = tail[1:]
+            return pn, tail.strip()
+        # کد کالا present but not a Number prefix — keep PN, no derived rev.
+        return pn, ""
     if "/" not in text:
         return text, ""
-    pn, rev = text.split("/", 1)
-    return pn.strip(), rev.strip()
+    left, rev = text.split("/", 1)
+    return left.strip(), rev.strip()
 
 
 def _entry_from_list_mapping(data: dict[str, Any]) -> BomListEntry | None:
@@ -1083,9 +1107,12 @@ def _entry_from_list_mapping(data: dict[str, Any]) -> BomListEntry | None:
         if not bom_id.isdigit():
             return None
 
+    # Prefer «کد کالا» / PartCode as part_number when the list row has it.
     part_number = str(
         data.get("part_number")
         or data.get("partNumber")
+        or data.get("PartCode")
+        or data.get("کد کالا")
         or data.get("code")
         or ""
     ).strip()
@@ -1100,14 +1127,16 @@ def _entry_from_list_mapping(data: dict[str, Any]) -> BomListEntry | None:
         or ""
     ).strip()
     if bom_code:
-        code_pn, code_rev = split_bom_code(bom_code)
-        # «کد BOM» / Number is the CRM canonical PN[/rev]; prefer it over PartCode.
-        if code_pn:
-            part_number = code_pn
-        if code_rev:
+        code_pn, code_rev = split_bom_code(
+            bom_code, part_number if part_number else None
+        )
+        if part_number:
+            # Keep کد کالا; revision is Number with that prefix (+ optional /) removed.
             revision = code_rev
-        elif not revision:
-            revision = ""
+        else:
+            # No کد کالا on the row — legacy Number first-/ split.
+            part_number = code_pn
+            revision = code_rev
 
     description = str(
         data.get("description")
@@ -1123,6 +1152,7 @@ def _entry_from_list_mapping(data: dict[str, Any]) -> BomListEntry | None:
         description=description,
         revision=revision,
         edit_url=edit_url,
+        number=bom_code,
     )
 
 
@@ -1272,13 +1302,12 @@ def match_bom_list_entries(
     description: str | None = None,
     revision: str | None = None,
 ) -> list[BomListEntry]:
-    """Match list rows by parent part number (from «کد BOM» / ``Number``).
+    """Match list rows by parent part number («کد کالا» / PartCode).
 
     Preference:
-    1. Exact part-number matches (case-insensitive) — the PN side of
-       ``Number`` when it contains ``/``, else the whole ``Number``.
+    1. Exact part-number matches (case-insensitive).
     2. If the query looks like a full ``Number`` (``PN/rev``), match that
-       exact PN+revision pair.
+       exact PN+revision pair (slash form only when no separate کد کالا).
     3. If multiple and ``revision`` is set, narrow by exact revision.
     4. Else if multiple and ``description`` is set, narrow by exact description.
     5. If no PN hits, fall back to exact description matches.
@@ -1291,6 +1320,7 @@ def match_bom_list_entries(
         return list(entries)
 
     # Allow callers to pass a full «کد BOM» value (e.g. 1155F229/A2*10-C).
+    # Legacy first-/ split only — not used by list_revisions_for_part StartsWith.
     query_pn, query_rev = split_bom_code(raw_pn)
     if query_rev and not rev:
         pn = query_pn.casefold()

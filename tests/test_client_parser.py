@@ -9,10 +9,12 @@ from unittest import mock
 
 from lithium_systemgroup import (
     AmbiguousBomMatch,
+    BomSearchResult,
     NoBomMatch,
     SystemGroupClient,
     SystemGroupClientError,
     SystemGroupParseError,
+    __version__,
     bi_to_hex,
     bom_edit_direct_url,
     bom_edit_url,
@@ -23,11 +25,13 @@ from lithium_systemgroup import (
     deterministic_randbelow,
     digit_size_for_modulus,
     encrypted_string,
+    entry_bom_number,
     extract_bom_id_from_url,
     extract_export_url_base,
     list_revisions_for_part,
     load_bom_list_entries,
     match_bom_list_entries,
+    match_number_startswith,
     normalize_crm_decimal,
     normalize_order_quantity,
     parse_bom_document,
@@ -148,21 +152,105 @@ class BomParseTests(unittest.TestCase):
 
 
 class BomListParseTests(unittest.TestCase):
+    def test_public_api_exports_bom_search_result(self):
+        self.assertTrue(issubclass(BomSearchResult, object))
+        self.assertRegex(__version__, r"^0\.2\.[7-9]|^0\.[3-9]")
+
     def test_split_bom_code(self):
+        # Legacy: no کد کالا — first-/ or whole string.
         self.assertEqual(split_bom_code("1155F229/A2*10-C"), ("1155F229", "A2*10-C"))
         self.assertEqual(split_bom_code("CGM5883"), ("CGM5883", ""))
+        # With کد کالا: slash and concatenated PN+rev.
+        self.assertEqual(
+            split_bom_code("1155F229/A2*10-C", "1155F229"),
+            ("1155F229", "A2*10-C"),
+        )
+        self.assertEqual(
+            split_bom_code("2183S914*2-C", "2183S914"),
+            ("2183S914", "*2-C"),
+        )
+        self.assertEqual(split_bom_code("CGM5883", "CGM5883"), ("CGM5883", ""))
+        # Missing / mismatched کد کالا.
+        self.assertEqual(split_bom_code("1155F229/A2*10-C", ""), ("1155F229", "A2*10-C"))
+        self.assertEqual(split_bom_code("1155F229/A2*10-C", None), ("1155F229", "A2*10-C"))
+        self.assertEqual(split_bom_code("2183S914*2-C", ""), ("2183S914*2-C", ""))
+        self.assertEqual(split_bom_code("1155F229/A2*10-C", "OTHER"), ("OTHER", ""))
 
     def test_parse_list_html_fixture(self):
         html = (FIXTURES / "bom_list.html").read_text(encoding="utf-8")
         entries = parse_bom_list_document(html, content_type="text/html")
         self.assertEqual(len(entries), 4)
         self.assertEqual(entries[0].bom_id, "39477")
+        # Fixture has only «کد BOM» (no کد کالا) — legacy first-/ split.
+        self.assertEqual(entries[0].part_number, "500-9001-00")
+        self.assertEqual(entries[0].revision, "1")
 
     def test_parse_telerik_list_json_fixture(self):
         raw = (FIXTURES / "bom_list_telerik.json").read_text(encoding="utf-8")
         entries = parse_bom_list_document(raw, content_type="application/json")
         self.assertEqual(entries[0].part_number, "1155F229")
         self.assertEqual(entries[0].revision, "A2*10-C")
+        # Concatenated Number with no slash: PartCode is PN, tail is revision.
+        by_id = {e.bom_id: e for e in entries}
+        concat = by_id["39482"]
+        self.assertEqual(concat.part_number, "2183S914")
+        self.assertEqual(concat.revision, "*2-C")
+        self.assertEqual(concat.number, "2183S914*2-C")
+        self.assertEqual(entry_bom_number(concat), "2183S914*2-C")
+        # Number equals PartCode → empty revision.
+        bare = by_id["39484"]
+        self.assertEqual(bare.part_number, "CGM5883")
+        self.assertEqual(bare.revision, "")
+
+    def test_entry_prefers_partcode_over_number_slash(self):
+        """List rows: کد کالا is PN; Number tail (after PN + optional /) is rev."""
+        from lithium_systemgroup.parser import _entry_from_list_mapping
+
+        slash = _entry_from_list_mapping(
+            {
+                "id": "1",
+                "PartCode": "1155F229",
+                "Number": "1155F229/A2*10-C",
+            }
+        )
+        self.assertEqual(slash.part_number, "1155F229")
+        self.assertEqual(slash.revision, "A2*10-C")
+
+        concat = _entry_from_list_mapping(
+            {
+                "id": "2",
+                "کد کالا": "2183S914",
+                "کد BOM": "2183S914*2-C",
+            }
+        )
+        self.assertEqual(concat.part_number, "2183S914")
+        self.assertEqual(concat.revision, "*2-C")
+
+        missing = _entry_from_list_mapping(
+            {"id": "3", "Number": "500-9001-00/1"}
+        )
+        self.assertEqual(missing.part_number, "500-9001-00")
+        self.assertEqual(missing.revision, "1")
+
+        missing_concat = _entry_from_list_mapping(
+            {"id": "4", "bom_code": "2183S914*2-C"}
+        )
+        self.assertEqual(missing_concat.part_number, "2183S914*2-C")
+        self.assertEqual(missing_concat.revision, "")
+
+    def test_match_number_startswith_keeps_concat_and_slash(self):
+        """Offline StartsWith uses raw Number; slash prefix is not stripped."""
+        raw = (FIXTURES / "bom_list_telerik.json").read_text(encoding="utf-8")
+        entries = parse_bom_list_document(raw, content_type="application/json")
+        slash_hits = match_number_startswith(entries, "1155F229/")
+        self.assertEqual([e.bom_id for e in slash_hits], ["39485"])
+        concat_hits = match_number_startswith(entries, "2183S914*")
+        self.assertEqual([e.bom_id for e in concat_hits], ["39482"])
+        # Extra rows must not appear for a precise slash prefix.
+        html = (FIXTURES / "bom_list.html").read_text(encoding="utf-8")
+        html_entries = parse_bom_list_document(html, content_type="text/html")
+        precise = match_number_startswith(html_entries, "500-9001-00/1")
+        self.assertEqual([e.bom_id for e in precise], ["39477"])
 
     def test_match_narrows_ambiguous_pn_with_revision(self):
         entries = parse_bom_list_document(
@@ -193,6 +281,7 @@ class BomListParseTests(unittest.TestCase):
         result = list_revisions_for_part(
             "500-9001-00", list_path=FIXTURES / "bom_list.json"
         )
+        self.assertIsInstance(result, BomSearchResult)
         self.assertGreaterEqual(len(result.entries), 2)
         self.assertEqual({r.part_number for r in result.entries}, {"500-9001-00"})
         self.assertFalse(result.truncated)
@@ -210,6 +299,7 @@ class BomListParseTests(unittest.TestCase):
         )
         self.assertEqual(len(capped.entries), 1)
         self.assertTrue(capped.truncated)
+        self.assertEqual(capped.max_results, 1)
 
 
 class ClientTests(unittest.TestCase):
@@ -542,6 +632,75 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(
             posted["lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number"],
             "500-9001-00",
+        )
+
+    def test_list_revisions_startswith_keeps_slash_prefix(self):
+        """Part ID with '/' is posted as Number StartsWith — not split_bom_code'd."""
+        login_html = (FIXTURES / "login.aspx.html").read_text(encoding="utf-8")
+        page1 = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        page1 = page1.replace(
+            '<input type="hidden" name="__EVENTVALIDATION"',
+            '<input id="lstEntities_Grid_MasterTableView_ctl02_ctl03_SgTextBox_Number" '
+            'name="lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number" '
+            'type="text" value="" />'
+            '<input type="hidden" name="__EVENTVALIDATION"',
+        )
+        filtered = (FIXTURES / "bom_list_page1.html").read_text(encoding="utf-8")
+        filtered = filtered.replace(
+            '<li class="rtbItem rtbBtn">'
+            '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+            '<li class="rtbItem rtbBtn rtbDisabled">'
+            '<a title="بعدی" class="rtbWrap" href="#"><span>Next</span></a></li>',
+        ).replace(
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li>'
+            '<li class="rcbItem ">صفحه2</li></ul>',
+            '<ul class="rcbList"><li class="rcbItem ">صفحه1</li></ul>',
+        )
+        delta = (
+            "1|#||4|"
+            f"{len(filtered)}|updatePanel|updatePanel|{filtered}"
+            "|0|hiddenField|__EVENTTARGET||0|hiddenField|__EVENTARGUMENT|"
+        )
+        session = mock.Mock()
+        login_get = mock.Mock(
+            status_code=200, text=login_html, url="http://crm/Authentication/Login.aspx"
+        )
+        login_get.raise_for_status = mock.Mock()
+        login_post = mock.Mock(
+            status_code=200, text="<html>ok</html>", url="http://crm/Default.aspx"
+        )
+        login_post.raise_for_status = mock.Mock()
+        list_get = mock.Mock(
+            status_code=200,
+            text=page1,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        list_get.raise_for_status = mock.Mock()
+        filter_post = mock.Mock(
+            status_code=200,
+            text=delta,
+            url="http://crm/List.aspx",
+            headers={"Content-Type": "text/plain"},
+        )
+        filter_post.raise_for_status = mock.Mock()
+        session.get.side_effect = [login_get, list_get]
+        session.post.side_effect = [login_post, filter_post]
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        result = list_revisions_for_part("500-9001-00/", client=client)
+        self.assertIsInstance(result, BomSearchResult)
+        self.assertEqual(result.query, "500-9001-00/")
+        filter_call = session.post.call_args_list[1]
+        posted = filter_call.kwargs.get("data") or filter_call.args[1]
+        self.assertIn(
+            "FireCommand:lstEntities$Grid$MasterTableView;Filter;Number|?500-9001-00/|?StartsWith",
+            posted["__EVENTARGUMENT"],
+        )
+        self.assertEqual(
+            posted["lstEntities$Grid$MasterTableView$ctl02$ctl03$SgTextBox_Number"],
+            "500-9001-00/",
         )
 
     def test_list_revisions_filter_zero_matches_skips_catalog_fallback(self):
