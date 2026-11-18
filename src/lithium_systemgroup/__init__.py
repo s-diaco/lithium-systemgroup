@@ -94,4 +94,4 @@ __all__ = [
     "unicode_correct_invalid_characters",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
