@@ -1107,6 +1107,52 @@ class ClientTests(unittest.TestCase):
         self.assertIn("شماره_حواله", body)
         self.assertIn("csv", ctype.lower())
 
+    def test_fetch_customer_orders_posts_filter_state(self):
+        export_html = (FIXTURES / "customer_orders_report.html").read_text(
+            encoding="utf-8"
+        )
+        session = mock.Mock()
+        report_get = mock.Mock(
+            status_code=200,
+            text=(
+                '<form action="./ReportViewer.aspx?PageID=9" method="post">'
+                '<input type="hidden" name="__VIEWSTATE" value="" />'
+                "</form>"
+            ),
+            url="http://crm/ReportViewer.aspx?PageID=9",
+        )
+        report_get.raise_for_status = mock.Mock()
+        posted = mock.Mock(
+            status_code=200,
+            text=export_html,
+            url="http://crm/ReportViewer.aspx?PageID=9",
+        )
+        posted.raise_for_status = mock.Mock()
+        export_get = mock.Mock(
+            status_code=200,
+            content=b"note,code\n",
+            url="http://crm/Reserved.ReportViewerWebControl.axd",
+            headers={"Content-Type": "text/csv"},
+        )
+        export_get.raise_for_status = mock.Mock()
+        session.get.side_effect = [report_get, export_get]
+        session.post.return_value = posted
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        client._logged_in = True
+        state = {"expression": {"filterItemName": "ord.Date"}}
+        body, ctype = client.fetch_customer_orders(filter_state=state)
+        self.assertEqual(body, "note,code\n")
+        self.assertIn("csv", ctype.lower())
+        self.assertIn("PageID=", session.get.call_args_list[0].args[0])
+        posted_data = session.post.call_args.kwargs["data"]
+        self.assertEqual(posted_data["__EVENTTARGET"], "reportViewer")
+        self.assertIn(
+            "ord.Date",
+            posted_data["reportViewer_GenericFilterTemplate_Filter_ord_ClientState"],
+        )
+
 
 class CustomerOrdersParseTests(unittest.TestCase):
     def test_normalize_order_quantity(self):
