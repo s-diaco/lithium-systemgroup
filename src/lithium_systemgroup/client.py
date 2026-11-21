@@ -939,21 +939,93 @@ class SystemGroupClient:
             )
         return resp.text, resp.headers.get("Content-Type", "text/html")
 
+    def _execute_customer_orders_filter(
+        self, report_path: str | None, filter_state: dict
+    ) -> str:
+        """POST an SgFilter expression, then return the ReportViewer delta.
+
+        PageID and TimeStamp key the server viewstate, same as the BoM list frame.
+        """
+        path = (report_path or customer_orders_report_path_from_env()).lstrip("/")
+        stamp = int(time.time() * 1000)
+        sep = "&" if "?" in path else "?"
+        page = (
+            f"{path}{sep}PageID={stamp}&TimeStamp={stamp}"
+            "&PageWidth=1050&PageHeight=670"
+        )
+        url = urljoin(self.base_url, page)
+        try:
+            resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            raise SystemGroupClientError(
+                f"Could not fetch customer orders report ({url.split('?', 1)[0]}): {exc}"
+            ) from exc
+        if "login.aspx" in (resp.url or "").lower():
+            raise SystemGroupClientError(
+                "Customer orders report redirected to login; check credentials."
+            )
+        action, fields = extract_aspnet_post_fields(resp.text)
+        post_url = urljoin(resp.url, action) if action and "PageID=" in action else resp.url
+        fields = strip_clientstate_updated(fields)
+        fields["__EVENTTARGET"] = "reportViewer"
+        fields["__EVENTARGUMENT"] = json.dumps(
+            {"commandName": "Execute"}, separators=(",", ":")
+        )
+        fields["__ASYNCPOST"] = "true"
+        fields["SgScriptManager1"] = "UpdatePanel1|reportViewer"
+        fields["reportViewer_GenericFilterTemplate_Filter_ord_ClientState"] = json.dumps(
+            filter_state, ensure_ascii=False, separators=(",", ":")
+        )
+        try:
+            posted = self.session.post(
+                post_url,
+                data=fields,
+                headers={
+                    "Referer": post_url,
+                    "X-MicrosoftAjax": "Delta=true",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=self.timeout,
+                allow_redirects=True,
+            )
+            posted.raise_for_status()
+        except requests.RequestException as exc:
+            raise SystemGroupClientError(
+                f"Could not execute customer orders report ({post_url.split('?', 1)[0]}): {exc}"
+            ) from exc
+        if "login.aspx" in (posted.url or "").lower():
+            raise SystemGroupClientError(
+                "Customer orders report redirected to login; check credentials."
+            )
+        if not extract_export_url_base(posted.text):
+            raise SystemGroupClientError(
+                "Customer orders filtered report had no ExportUrlBase."
+            )
+        return posted.text
+
     def fetch_customer_orders(
         self,
         report_path: str | None = None,
         *,
         export_format: str = "CSV",
+        filter_state: dict | None = None,
     ) -> tuple[str, str]:
         """Open the store orders report and download an export (default CSV).
 
         ReportViewer keeps a ``ReportSession`` on first GET; exports use
         ``ExportUrlBase`` + format (CSV / XML / EXCELOPENXML). Shell chrome is
         not required — same preference as direct BoM pages.
+
+        ``filter_state`` is an SgFilter client-state object. When set, the report
+        runs with that filter before the export, so the CSV is smaller.
         """
         if not self._logged_in:
             self.login()
-        html, _ctype = self.fetch_customer_orders_report(report_path)
+        if filter_state is not None:
+            html = self._execute_customer_orders_filter(report_path, filter_state)
+        else:
+            html, _ctype = self.fetch_customer_orders_report(report_path)
         export_base = extract_export_url_base(html)
         if not export_base:
             raise SystemGroupClientError(
