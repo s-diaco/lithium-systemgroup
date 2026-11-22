@@ -11,6 +11,7 @@ from lithium_systemgroup import (
     AmbiguousBomMatch,
     BomListEntry,
     BomSearchResult,
+    InventoryLine,
     NoBomMatch,
     SystemGroupClient,
     SystemGroupClientError,
@@ -30,6 +31,8 @@ from lithium_systemgroup import (
     entry_bom_number,
     extract_bom_id_from_url,
     extract_export_url_base,
+    filter_inventory_lines,
+    inventory_quantity,
     list_revisions_for_part,
     load_bom_list_entries,
     match_bom_list_entries,
@@ -42,6 +45,8 @@ from lithium_systemgroup import (
     parse_bom_list_pager,
     parse_customer_orders_document,
     parse_login_form,
+    parse_quantitative_review_document,
+    quantitative_review_frame_url,
     resolve_bom_from_list,
     split_bom_code,
     unicode_correct_invalid_characters,
@@ -1178,6 +1183,107 @@ class CustomerOrdersParseTests(unittest.TestCase):
     def test_empty_orders_raise(self):
         with self.assertRaises(SystemGroupParseError):
             parse_customer_orders_document("   ")
+
+
+class QuantitativeReviewTests(unittest.TestCase):
+    def test_frame_url_has_pageid_timestamp(self):
+        url = quantitative_review_frame_url(
+            "http://crm.example/", timestamp_ms=1700000000000
+        )
+        self.assertIn("QuantitativeReview/Review.aspx", url)
+        self.assertIn("PageID=1", url)
+        self.assertIn("TimeStamp=1700000000000", url)
+        self.assertNotIn("Shell.aspx", url)
+
+    def test_inventory_quantity(self):
+        self.assertEqual(inventory_quantity("‎147‏"), 147.0)
+        self.assertEqual(inventory_quantity("8,450"), 8450.0)
+        self.assertEqual(inventory_quantity(""), 0.0)
+
+    def test_parse_fixture_rows(self):
+        html = (FIXTURES / "quantitative_review.html").read_text(encoding="utf-8")
+        rows = parse_quantitative_review_document(html)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].part_code, "ICJ/308")
+        self.assertEqual(rows[0].quantity, 147.0)
+        self.assertEqual(rows[0].nature, "محصول نهایی")
+        self.assertEqual(rows[1].part_code, "503-09")
+        self.assertEqual(rows[1].quantity, 8450.0)
+        self.assertIn("ICQ", rows[1].title)
+
+    def test_filter_prefixes_and_regex(self):
+        html = (FIXTURES / "quantitative_review.html").read_text(encoding="utf-8")
+        rows = parse_quantitative_review_document(html)
+        products = filter_inventory_lines(rows, code_prefixes=("ICJ/", "RMJ/"))
+        self.assertEqual([r.part_code for r in products], ["ICJ/308"])
+        raw = filter_inventory_lines(rows, text_regex=r"ICQ|RMS/")
+        self.assertEqual([r.part_code for r in raw], ["503-09"])
+
+    def test_pager_parses_from_fixture(self):
+        html = (FIXTURES / "quantitative_review.html").read_text(encoding="utf-8")
+        pager = parse_bom_list_pager(html)
+        self.assertIsNotNone(pager)
+        assert pager is not None
+        self.assertEqual(pager.current_page, 1)
+        self.assertEqual(pager.page_count, 2)
+        self.assertTrue(pager.next_enabled)
+        self.assertIn("Pager", pager.pager_target or "")
+
+    def test_fetch_quantitative_review_lines_pages(self):
+        page1 = (FIXTURES / "quantitative_review.html").read_text(encoding="utf-8")
+        # Second page: one more product row, Next disabled.
+        page2 = page1.replace("صفحه1", "صفحه2").replace(
+            'class="rtbItem rtbBtn"><a title="بعدی"',
+            'class="rtbItem rtbBtn rtbDisabled"><a title="بعدی"',
+            1,
+        ).replace(
+            "<td>ICJ/308</td>",
+            "<td>ICJ/109</td>",
+            1,
+        ).replace("‎147‏", "650", 1)
+
+        delta = (
+            f"{len('updatePanel|SgUpdatePanel1|' + page2)}"
+            f"|updatePanel|SgUpdatePanel1|{page2}"
+        )
+        login_get = mock.Mock(
+            text="<html></html>",
+            url="http://crm/Authentication/Login.aspx",
+            headers={"Content-Type": "text/html"},
+        )
+        login_get.raise_for_status = mock.Mock()
+        first_get = mock.Mock(
+            text=page1,
+            url="http://crm/Logistics/InventoryReports/QuantitativeReview/Review.aspx?PageID=1",
+            headers={"Content-Type": "text/html"},
+        )
+        first_get.raise_for_status = mock.Mock()
+        next_post = mock.Mock(
+            text=delta,
+            url="http://crm/Logistics/InventoryReports/QuantitativeReview/Review.aspx?PageID=1",
+            headers={"Content-Type": "text/plain"},
+        )
+        next_post.raise_for_status = mock.Mock()
+
+        session = mock.Mock()
+        # login GET happens only if not logged in; we set _logged_in.
+        session.get.return_value = first_get
+        session.post.return_value = next_post
+
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        client._logged_in = True
+        lines = client.fetch_quantitative_review_lines(max_pages=5)
+        codes = [line.part_code for line in lines]
+        self.assertIn("ICJ/308", codes)
+        self.assertIn("ICJ/109", codes)
+        self.assertTrue(any(isinstance(line, InventoryLine) for line in lines))
+        self.assertEqual(session.post.call_args.kwargs["data"]["__EVENTARGUMENT"], "3")
+        self.assertIn(
+            "SgUpdatePanel1|",
+            session.post.call_args.kwargs["data"]["ScriptManager1"],
+        )
 
 
 if __name__ == "__main__":

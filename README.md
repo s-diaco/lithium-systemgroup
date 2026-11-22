@@ -1,10 +1,11 @@
 # lithium-systemgroup
 
-SystemGroup CRM client and BoM / customer-order parsers for Python projects.
+SystemGroup CRM client and BoM / inventory / customer-order parsers for Python projects.
 
-Talks to the on-LAN SystemGroup PAC Engineering CRM (forms-auth login, BoM list,
-BoM edit, store delivery-note report) and returns structured data.
-Framework-agnostic; no ORM or app models.
+Talks to the on-LAN SystemGroup CRM (forms-auth login, BoM list, BoM edit,
+quantitative inventory review, store delivery-note report) and returns structured
+data. Framework-agnostic; no ORM or app models. Host and credentials come from
+the environment — never hard-code them.
 
 ## Install
 
@@ -54,6 +55,15 @@ csv_body, csv_ctype = orders_client.fetch_customer_orders()
 orders = parse_customer_orders_document(csv_body, content_type=csv_ctype)
 for row in orders:
     print(row.delivery_note_number, row.customer_name, row.product_code, row.remaining_quantity)
+
+# Quantitative inventory review (مرور تعدادی انبار)
+from lithium_systemgroup import filter_inventory_lines
+
+stock = client.fetch_quantitative_review_lines()
+products = filter_inventory_lines(stock, code_prefixes=("ICJ/", "RMJ/"))
+raw = filter_inventory_lines(stock, text_regex=r"ICQ|RMS/")
+for row in products:
+    print(row.part_code, row.quantity)
 ```
 
 ## Environment variables
@@ -65,6 +75,7 @@ for row in orders:
 | `REPORT_BASE_URL` | Report host base URL (orders report). Falls back to `CRM_BASE_URL`. |
 | `REPORT_USERNAME` / `REPORT_PASSWORD` | Forms-auth for the report host. Fall back to `CRM_*`. |
 | `REPORT_ORDERS_PATH` | Optional ReportViewer path (no host). Default: store delivery-note report under `/CustomerReports/Store/…`. |
+| `CRM_QUANTITATIVE_REVIEW_PATH` | Optional QuantitativeReview path (no host). Default: `Logistics/InventoryReports/QuantitativeReview/Review.aspx`. Falls back to `REPORT_QUANTITATIVE_REVIEW_PATH`. |
 
 Never commit credentials. Prefer a gitignored env file or the process environment.
 
@@ -72,8 +83,8 @@ Never commit credentials. Prefer a gitignored env file or the process environmen
 
 | Module | Role |
 |--------|------|
-| `client` | ASP.NET forms-auth session; fetch BoM list / edit (list paging uses Shell-framed List.aspx + async Next); export customer-orders CSV |
-| `parser` | Login form, BoM edit/list HTML/JSON, customer-orders CSV |
+| `client` | ASP.NET forms-auth session; fetch BoM list / edit (Shell-framed List.aspx + async Next); QuantitativeReview inventory paging; export customer-orders CSV |
+| `parser` | Login form, BoM edit/list HTML/JSON, QuantitativeReview grid rows, customer-orders CSV |
 | `rsa_login` | CRM RSA password hashing used by Login.aspx |
 | `catalog` | List load + match helpers (`list_revisions_for_part`, `resolve_bom_from_list`) |
 

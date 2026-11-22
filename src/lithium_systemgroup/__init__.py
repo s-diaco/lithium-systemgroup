@@ -1,4 +1,4 @@
-"""SystemGroup CRM client and BoM / customer-order parsers for Python projects."""
+"""SystemGroup CRM client and BoM / inventory / customer-order parsers."""
 
 from .catalog import (
     AmbiguousBomMatch,
@@ -17,6 +17,7 @@ from .client import (
     BomListPager,
     SystemGroupClient,
     SystemGroupClientError,
+    apply_async_entity_list_delta,
     apply_bom_list_async_delta,
     bom_edit_direct_url,
     bom_edit_url,
@@ -32,6 +33,8 @@ from .client import (
     extract_export_url_base,
     parse_bom_list_pager,
     parse_pager_next_argument,
+    quantitative_review_frame_url,
+    quantitative_review_path_from_env,
     report_credentials_from_env,
     strip_clientstate_updated,
 )
@@ -39,9 +42,12 @@ from .parser import (
     BomLine,
     BomListEntry,
     CustomerOrderLine,
+    InventoryLine,
     LoginFormFields,
     ParsedBom,
     SystemGroupParseError,
+    filter_inventory_lines,
+    inventory_quantity,
     match_bom_list_entries,
     normalize_crm_decimal,
     normalize_order_quantity,
@@ -49,6 +55,7 @@ from .parser import (
     parse_bom_list_document,
     parse_customer_orders_document,
     parse_login_form,
+    parse_quantitative_review_document,
     split_bom_code,
 )
 from .rsa_login import (
@@ -68,6 +75,7 @@ __all__ = [
     "BomSearchResult",
     "CustomerOrderLine",
     "DEFAULT_MAX_RESULTS",
+    "InventoryLine",
     "LoginFormFields",
     "NoBomMatch",
     "ParsedBom",
@@ -76,6 +84,7 @@ __all__ = [
     "SystemGroupError",
     "SystemGroupParseError",
     "bi_to_hex",
+    "apply_async_entity_list_delta",
     "apply_bom_list_async_delta",
     "bom_edit_direct_url",
     "bom_edit_url",
@@ -94,6 +103,8 @@ __all__ = [
     "extract_aspnet_post_fields",
     "extract_bom_id_from_url",
     "extract_export_url_base",
+    "filter_inventory_lines",
+    "inventory_quantity",
     "list_revisions_for_part",
     "load_bom_list_entries",
     "match_bom_list_entries",
@@ -107,6 +118,9 @@ __all__ = [
     "parse_customer_orders_document",
     "parse_login_form",
     "parse_pager_next_argument",
+    "parse_quantitative_review_document",
+    "quantitative_review_frame_url",
+    "quantitative_review_path_from_env",
     "report_credentials_from_env",
     "resolve_bom_from_list",
     "split_bom_code",
@@ -114,4 +128,4 @@ __all__ = [
     "unicode_correct_invalid_characters",
 ]
 
-__version__ = "0.2.8"
+__version__ = "0.2.9"

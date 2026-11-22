@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head><title>مرور تعدادی انبار</title></head>
+<body>
+<form method="post" action="./Review.aspx?PageID=1&amp;TimeStamp=1">
+<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="vs" />
+<input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="ev" />
+<input type="hidden" name="ScriptManager1" id="ScriptManager1" value="" />
+<table class="rgMasterTable">
+<thead><tr class="rgHeader">
+<th>شناسه</th><th>کد</th><th>عنوان</th><th>مشخصه فنی</th>
+<th>ماهیت کالا</th><th>ماهیت کالا 1</th><th>واحد سنجش (اصلی)</th>
+<th>مانده از قبل (اصلی)</th><th>ابتدای دوره (اصلی)</th>
+<th>ورودی (اصلی)</th><th>خروجی (اصلی)</th><th>مانده (اصلی)</th>
+</tr></thead>
+<tbody>
+<tr class="rgRow">
+<td>1,000,020,011,775</td>
+<td>ICJ/308</td>
+<td>جوهر آبی BLUE INK INCO</td>
+<td></td>
+<td>محصول نهایی</td>
+<td>محصول نهایی</td>
+<td>کیلو گرم</td>
+<td>0</td><td>0</td><td>10</td><td>0</td>
+<td>‎147‏</td>
+</tr>
+<tr class="rgAltRow">
+<td>1,000,020,011,700</td>
+<td>503-09</td>
+<td>رنگدانه آبی (کبالتی) اینکو ICQ 12/ Q 300</td>
+<td></td>
+<td>ماده اولیه</td>
+<td>ماده اولیه</td>
+<td>کیلو گرم</td>
+<td>0</td><td>0</td><td>8450</td><td>0</td>
+<td>8,450</td>
+</tr>
+</tbody>
+</table>
+<div id="sheetViewer4_Grid_MasterTableView_ctl03_ctl02_Pager"
+ class="RadToolBar EntityListPaging">
+<ul>
+<li class="rtbItem rtbBtn rtbDisabled"><a title="ابتدا" href="#"></a></li>
+<li class="rtbItem rtbBtn rtbDisabled"><a title="قبلی" href="#"></a></li>
+<li class="rtbItem rtbTemplate">
+<input id="sheetViewer4_Grid_MasterTableView_ctl03_ctl02_Pager_i2_cboPage_Input"
+ name="sheetViewer4$Grid$MasterTableView$ctl03$ctl02$Pager$i2$cboPage"
+ value="صفحه1" />
+<ul>
+<li class="rcbItem">صفحه1</li>
+<li class="rcbItem">صفحه2</li>
+</ul>
+</li>
+<li class="rtbItem rtbBtn"><a title="بعدی" href="#"></a></li>
+<li class="rtbItem rtbBtn"><a title="انتها" href="#"></a></li>
+</ul>
+</div>
+<script type="text/javascript">
+Sys.Application.add_init(function() {
+  $create(Sg.UI.Controls.SgToolBar, {
+    "_rawPostBackReference":"WebForm_DoPostBackWithOptions(new WebForm_PostBackOptions(\u0027sheetViewer4$Grid$MasterTableView$ctl03$ctl02$Pager\u0027, \u0027{0}\u0027, true, \u0027\u0027, \u0027\u0027, false, true))",
+    "itemData":[{"value":"First"},{"value":"Previous"},{"value":"Pages"},{"value":"Next"},{"value":"Last"}]
+  }, null, null, $get("sheetViewer4_Grid_MasterTableView_ctl03_ctl02_Pager"));
+});
+</script>
+</form>
+</body>
+</html>
