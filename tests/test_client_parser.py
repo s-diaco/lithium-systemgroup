@@ -162,7 +162,7 @@ class BomParseTests(unittest.TestCase):
 class BomListParseTests(unittest.TestCase):
     def test_public_api_exports_bom_search_result(self):
         self.assertTrue(issubclass(BomSearchResult, object))
-        self.assertRegex(__version__, r"^0\.2\.[7-9]|^0\.[3-9]")
+        self.assertRegex(__version__, r"^0\.2\.(?:[7-9]|\d{2,})|^0\.[3-9]")
 
     def test_split_bom_code(self):
         # Legacy: no کد کالا — first-/ or whole string.
@@ -477,11 +477,19 @@ class ClientTests(unittest.TestCase):
             "a": '{"x":1,"__Updated":true}',
             "b": '{"__Updated":true}',
             "c": "plain",
+            "date": (
+                '{"selectedDate":"\\/Date(1774038600000)\\/",'
+                '"__Updated":true}'
+            ),
         }
         out = strip_clientstate_updated(fields)
         self.assertEqual(out["a"], '{"x":1}')
         self.assertEqual(out["b"], "{}")
         self.assertEqual(out["c"], "plain")
+        self.assertEqual(
+            out["date"],
+            '{"selectedDate":"\\/Date(1774038600000)\\/"}',
+        )
 
     def test_apply_bom_list_async_delta_keeps_pager_target(self):
         from lithium_systemgroup import apply_bom_list_async_delta
@@ -1284,6 +1292,91 @@ class QuantitativeReviewTests(unittest.TestCase):
             "SgUpdatePanel1|",
             session.post.call_args.kwargs["data"]["ScriptManager1"],
         )
+
+    def test_discover_store_filter_fields(self):
+        from lithium_systemgroup.client import (
+            discover_quantitative_review_store_filter_fields,
+            store_id_from_quantitative_review_sheet,
+            quantitative_review_tab_index,
+        )
+
+        html = (FIXTURES / "quantitative_review.html").read_text(encoding="utf-8")
+        fields = discover_quantitative_review_store_filter_fields(html)
+        self.assertEqual(fields["tab_clientstate"], "tabStrip_ClientState")
+        self.assertEqual(fields["store_tab_index"], "1")
+        self.assertEqual(fields["part_tab_index"], "4")
+        self.assertIn("sheetViewer1_GridSettingsHiddenFieldKey_", fields["store_settings"])
+        self.assertEqual(quantitative_review_tab_index(html, "انبار"), 1)
+        self.assertEqual(
+            store_id_from_quantitative_review_sheet(html, "2002"),
+            "1200000000021",
+        )
+        self.assertEqual(
+            store_id_from_quantitative_review_sheet(html, "2001"),
+            "1200000000020",
+        )
+
+    def test_fetch_quantitative_review_lines_warehouse_filter(self):
+        page1 = (FIXTURES / "quantitative_review.html").read_text(encoding="utf-8")
+        filtered = page1.replace(
+            "هیچ شرطی انتخاب نشده است",
+            '<li class="last">انبار: انبار محصول اینکو</li>',
+        )
+
+        def panel_delta(html: str) -> str:
+            body = f"updatePanel|SgUpdatePanel1|{html}"
+            return f"{len(body)}|{body}"
+
+        first_get = mock.Mock(
+            text=page1,
+            url="http://crm/Logistics/InventoryReports/QuantitativeReview/Review.aspx?PageID=1",
+            headers={"Content-Type": "text/html"},
+        )
+        first_get.raise_for_status = mock.Mock()
+        # 1) انبار tab  2) DefaultCommand  3) کالا tab
+        posts = [
+            mock.Mock(
+                text=panel_delta(page1),
+                url=first_get.url,
+                headers={"Content-Type": "text/plain"},
+            ),
+            mock.Mock(
+                text=panel_delta(filtered),
+                url=first_get.url,
+                headers={"Content-Type": "text/plain"},
+            ),
+            mock.Mock(
+                text=panel_delta(filtered),
+                url=first_get.url,
+                headers={"Content-Type": "text/plain"},
+            ),
+        ]
+        for p in posts:
+            p.raise_for_status = mock.Mock()
+
+        session = mock.Mock()
+        session.get.return_value = first_get
+        session.post.side_effect = posts
+
+        client = SystemGroupClient(
+            base_url="http://crm/", username="u", password="p", session=session
+        )
+        client._logged_in = True
+        lines = client.fetch_quantitative_review_lines(
+            max_pages=1, warehouse_code="2002"
+        )
+        self.assertEqual(lines[0].part_code, "ICJ/308")
+        self.assertEqual(session.post.call_count, 3)
+        tab1 = session.post.call_args_list[0].kwargs["data"]
+        self.assertEqual(tab1["__EVENTTARGET"], "tabStrip")
+        self.assertEqual(tab1["__EVENTARGUMENT"], "1")
+        select = session.post.call_args_list[1].kwargs["data"]
+        self.assertEqual(select["__EVENTTARGET"], "sheetViewer1")
+        self.assertIn('"commandName":"DefaultCommand"', select["__EVENTARGUMENT"])
+        self.assertIn("1200000000021", select["__EVENTARGUMENT"])
+        tab_part = session.post.call_args_list[2].kwargs["data"]
+        self.assertEqual(tab_part["__EVENTTARGET"], "tabStrip")
+        self.assertEqual(tab_part["__EVENTARGUMENT"], "4")
 
 
 if __name__ == "__main__":

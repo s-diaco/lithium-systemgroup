@@ -33,9 +33,14 @@ from .client import (
     extract_export_url_base,
     parse_bom_list_pager,
     parse_pager_next_argument,
+    discover_quantitative_review_store_filter_fields,
     quantitative_review_frame_url,
     quantitative_review_path_from_env,
+    quantitative_review_tab_index,
     report_credentials_from_env,
+    store_id_from_quantitative_review_sheet,
+    store_list_frame_url,
+    store_list_path_from_env,
     strip_clientstate_updated,
 )
 from .parser import (
@@ -97,6 +102,7 @@ __all__ = [
     "customer_orders_report_url",
     "deterministic_randbelow",
     "digit_size_for_modulus",
+    "discover_quantitative_review_store_filter_fields",
     "encrypted_string",
     "entry_bom_number",
     "extract_aspnet_form_fields",
@@ -121,11 +127,15 @@ __all__ = [
     "parse_quantitative_review_document",
     "quantitative_review_frame_url",
     "quantitative_review_path_from_env",
+    "quantitative_review_tab_index",
     "report_credentials_from_env",
     "resolve_bom_from_list",
     "split_bom_code",
+    "store_id_from_quantitative_review_sheet",
+    "store_list_frame_url",
+    "store_list_path_from_env",
     "strip_clientstate_updated",
     "unicode_correct_invalid_characters",
 ]
 
-__version__ = "0.2.9"
+__version__ = "0.2.10"

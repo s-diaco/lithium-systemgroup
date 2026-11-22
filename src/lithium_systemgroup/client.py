@@ -74,6 +74,31 @@ DEFAULT_QUANTITATIVE_REVIEW_MAX_PAGES = 500
 DEFAULT_QUANTITATIVE_REVIEW_PAGE_ID = "1"
 DEFAULT_QUANTITATIVE_REVIEW_PAGE_WIDTH = "1050"
 DEFAULT_QUANTITATIVE_REVIEW_PAGE_HEIGHT = "670"
+# Store EntityList used to resolve انبار Number → entity id for ReviewHeaderFilter.
+DEFAULT_STORE_LIST_PAGE = (
+    "List.aspx?ComponentName=SystemGroup.Logistics.InventoryManagement"
+    "&EntityName=Store"
+)
+# QuantitativeReview tabStrip: انبار=Store sheetViewer1, کالا=inventory sheetViewer4.
+_QR_TAB_STRIP_CLIENTSTATE = "tabStrip_ClientState"
+_QR_MULTI_PAGE_CLIENTSTATE = "multiPage_ClientState"
+_QR_STORE_SHEET = "sheetViewer1"
+_QR_PART_SHEET = "sheetViewer4"
+_QR_STORE_TAB_LABEL = "انبار"
+_QR_PART_TAB_LABEL = "کالا"
+_QR_TAB_LABELS = re.compile(
+    r'class="rtsTxt"[^>]*>([^<]*)</',
+    re.IGNORECASE,
+)
+_QR_STORE_SETTINGS_FIELD = re.compile(
+    rf'name="({re.escape(_QR_STORE_SHEET)}_GridSettingsHiddenFieldKey_[^"]+)"',
+)
+_QR_STORE_ROW = re.compile(
+    rf'<tr[^>]*\bid="{re.escape(_QR_STORE_SHEET)}_Grid_MasterTableView__\d+"[^>]*>'
+    r"(.*?)</tr>",
+    re.IGNORECASE | re.DOTALL,
+)
+_QR_STORE_CELL = re.compile(r"<td[^>]*>(.*?)</td>", re.IGNORECASE | re.DOTALL)
 
 _EXPORT_URL_BASE = re.compile(
     r'ExportUrlBase["\']?\s*:\s*["\']([^"\']+)["\']',
@@ -97,6 +122,10 @@ _FORM_ACTION = re.compile(
 )
 # EntityListPaging toolbar: PostBackOptions('…Pager', '{0}', …) — not the page combo.
 # Live CRM scripts often emit quotes as \u0027 inside $create JSON blobs.
+_PAGER_FROM_CBO_PAGE = re.compile(
+    r'name="([^"]+\$Pager)\$i\d+\$cboPage"',
+    re.IGNORECASE,
+)
 _PAGER_POSTBACK_TARGET = re.compile(
     r"WebForm_PostBackOptions\(\s*(?:\\u0027|[\"'])"
     r"([^\"'\\]+Pager)"
@@ -189,8 +218,25 @@ def extract_aspnet_post_fields(html: str) -> tuple[str, dict[str, str]]:
     return action, fields
 
 
+def _escape_aspnet_date_clientstate(value: str) -> str:
+    """Re-escape ``/Date(ms)/`` to ``\\/Date(ms)\\/`` after JSON dumps.
+
+    SgDatePicker rejects unescaped ``/Date()/`` ClientState (InvalidCastException).
+    ``json.loads``/``dumps`` normalizes ``\\/`` to ``/``; restore ASP.NET form.
+    """
+    return re.sub(
+        r'"/Date\((-?\d+)\)/"',
+        r'"\\/Date(\1)\\/"',
+        value or "",
+    )
+
+
 def strip_clientstate_updated(fields: dict[str, str]) -> dict[str, str]:
-    """Drop reserved ``__Updated`` markers from Sg ClientState JSON values."""
+    """Drop reserved ``__Updated`` markers from Sg ClientState JSON values.
+
+    Prefer string surgery so ASP.NET ``\\/Date(ms)\\/`` escapes survive; fall
+    back to JSON round-trip with date re-escape when the marker is nested.
+    """
     out: dict[str, str] = {}
     for key, value in fields.items():
         if (
@@ -198,15 +244,26 @@ def strip_clientstate_updated(fields: dict[str, str]) -> dict[str, str]:
             and value.startswith("{")
             and '"__Updated"' in value
         ):
-            try:
-                obj = json.loads(value)
-            except json.JSONDecodeError:
-                out[key] = value
-                continue
-            if isinstance(obj, dict) and "__Updated" in obj:
-                obj = dict(obj)
-                obj.pop("__Updated", None)
-                value = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+            stripped = (
+                value.replace(',"__Updated":true', "")
+                .replace('"__Updated":true,', "")
+                .replace(',"__Updated":false', "")
+                .replace('"__Updated":false,', "")
+            )
+            if '"__Updated"' not in stripped:
+                value = stripped
+            else:
+                try:
+                    obj = json.loads(value)
+                except json.JSONDecodeError:
+                    out[key] = value
+                    continue
+                if isinstance(obj, dict) and "__Updated" in obj:
+                    obj = dict(obj)
+                    obj.pop("__Updated", None)
+                    value = _escape_aspnet_date_clientstate(
+                        json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+                    )
         out[key] = value
     return out
 
@@ -250,6 +307,16 @@ def parse_bom_list_pager(html: str) -> BomListPager | None:
             continue
         pager_target = target
         break
+    # Async merges often drop $create scripts; recover target from cboPage name.
+    if not pager_target:
+        candidates = [m.group(1) for m in _PAGER_FROM_CBO_PAGE.finditer(html)]
+        # Prefer inventory sheet (کالا) when Store/other sheet pagers also linger.
+        for cand in candidates:
+            if cand.startswith(f"{_QR_PART_SHEET}$"):
+                pager_target = cand
+                break
+        if not pager_target and candidates:
+            pager_target = candidates[-1]
 
     page_numbers = [
         int(m.group(1))
@@ -389,13 +456,15 @@ def apply_bom_list_async_delta(html: str, delta: str) -> str:
 
 def _async_script_manager_field(fields: dict[str, str]) -> str:
     """Pick the ScriptManager post field used for ``panel|target`` async posts."""
-    if "ScriptManager1" in fields:
+    if "ScriptManager1" in fields or "ScriptManager1_TSM" in fields:
         return "ScriptManager1"
-    if "scriptManager" in fields:
+    if "scriptManager" in fields or "scriptManager_TSM" in fields:
         return "scriptManager"
     for key in fields:
         if key.startswith("ScriptManager") and not key.endswith("_TSM"):
             return key
+        if key.startswith("ScriptManager") and key.endswith("_TSM"):
+            return key[: -len("_TSM")]
     return "scriptManager"
 
 
@@ -553,6 +622,15 @@ def quantitative_review_path_from_env() -> str:
     ).lstrip("/")
 
 
+def store_list_path_from_env() -> str:
+    """Optional Store EntityList path (no host) for انبار Number → id lookup."""
+    return (
+        os.environ.get("CRM_STORE_LIST_PATH")
+        or os.environ.get("REPORT_STORE_LIST_PATH")
+        or DEFAULT_STORE_LIST_PAGE
+    ).lstrip("/")
+
+
 def quantitative_review_frame_url(
     base_url: str,
     *,
@@ -571,6 +649,80 @@ def quantitative_review_frame_url(
         f"?PageID={page_id}&TimeStamp={ts}"
         f"&PageWidth={page_width}&PageHeight={page_height}",
     )
+
+
+def store_list_frame_url(
+    base_url: str,
+    *,
+    path: str | None = None,
+    page_id: str = DEFAULT_BOM_LIST_PAGE_ID,
+    timestamp_ms: int | None = None,
+    page_width: str = DEFAULT_BOM_LIST_PAGE_WIDTH,
+    page_height: str = DEFAULT_BOM_LIST_PAGE_HEIGHT,
+) -> str:
+    """Shell-framed Store EntityList URL with PageID/TimeStamp."""
+    ts = int(time.time() * 1000) if timestamp_ms is None else int(timestamp_ms)
+    list_path = (path or store_list_path_from_env()).lstrip("/")
+    sep = "&" if "?" in list_path else "?"
+    return urljoin(
+        base_url,
+        f"{list_path}{sep}PageID={page_id}&TimeStamp={ts}"
+        f"&PageWidth={page_width}&PageHeight={page_height}",
+    )
+
+
+def quantitative_review_tab_index(html: str, label: str) -> int | None:
+    """Return RadTabStrip index for a visible tab label (``rtsTxt``), or None."""
+    want = (label or "").strip()
+    if not want:
+        return None
+    for index, text in enumerate(_QR_TAB_LABELS.findall(html or "")):
+        if unescape(text).strip() == want:
+            return index
+    return None
+
+
+def store_id_from_quantitative_review_sheet(html: str, store_number: str) -> str | None:
+    """Return Store entity id for ``store_number`` from sheetViewer1 rows."""
+    code = (store_number or "").strip()
+    if not code:
+        return None
+    for row_html in _QR_STORE_ROW.findall(html or ""):
+        cells = [
+            re.sub(r"[\u200e\u200f\s,]", "", unescape(re.sub(r"<[^>]+>", "", c))).strip()
+            for c in _QR_STORE_CELL.findall(row_html)
+        ]
+        if len(cells) < 2:
+            continue
+        # Hidden id cell first, Number second (live ReviewFetch_Store).
+        if cells[1] == code and cells[0].isdigit():
+            return cells[0]
+    return None
+
+
+def discover_quantitative_review_store_filter_fields(html: str) -> dict[str, str]:
+    """Return QuantitativeReview انبار-tab control names from HTML."""
+    found: dict[str, str] = {}
+    if f'name="{_QR_TAB_STRIP_CLIENTSTATE}"' in (html or "") or 'id="tabStrip"' in (
+        html or ""
+    ):
+        found["tab_clientstate"] = _QR_TAB_STRIP_CLIENTSTATE
+    if f'name="{_QR_MULTI_PAGE_CLIENTSTATE}"' in (html or "") or 'id="multiPage"' in (
+        html or ""
+    ):
+        found["multi_page_clientstate"] = _QR_MULTI_PAGE_CLIENTSTATE
+    settings = _QR_STORE_SETTINGS_FIELD.search(html or "")
+    if settings:
+        found["store_settings"] = settings.group(1)
+    if f'name="{_QR_STORE_SHEET}_ClientState"' in (html or ""):
+        found["store_clientstate"] = f"{_QR_STORE_SHEET}_ClientState"
+    store_tab = quantitative_review_tab_index(html, _QR_STORE_TAB_LABEL)
+    if store_tab is not None:
+        found["store_tab_index"] = str(store_tab)
+    part_tab = quantitative_review_tab_index(html, _QR_PART_TAB_LABEL)
+    if part_tab is not None:
+        found["part_tab_index"] = str(part_tab)
+    return found
 
 
 class SystemGroupClient:
@@ -1153,32 +1305,41 @@ class SystemGroupClient:
         self._quantitative_review_post_url = resp.url or url
         return resp.text, resp.headers.get("Content-Type", "text/html")
 
-    def _post_quantitative_review_next(
-        self, html: str, pager: BomListPager
+    def _quantitative_review_post_url_for(self, html: str) -> str:
+        action, _ = extract_aspnet_post_fields(html)
+        post_url = getattr(self, "_quantitative_review_post_url", None) or (
+            quantitative_review_frame_url(self.base_url)
+        )
+        if action:
+            post_url = urljoin(post_url, action)
+        return post_url
+
+    def _post_quantitative_review_async(
+        self,
+        html: str,
+        *,
+        event_target: str,
+        event_argument: str = "",
+        field_updates: dict[str, str] | None = None,
+        label: str = "postback",
     ) -> tuple[str, str]:
-        """Async-post EntityListPaging Next on QuantitativeReview."""
-        if not pager.pager_target:
+        """Async-post QuantitativeReview UpdatePanel; return merged (html, ctype)."""
+        if not event_target:
             raise SystemGroupClientError(
-                "QuantitativeReview pager has no postback target for Next."
+                f"QuantitativeReview {label}: missing __EVENTTARGET."
             )
         _, fields = extract_aspnet_post_fields(html)
         payload = strip_clientstate_updated(fields)
+        if field_updates:
+            payload.update(field_updates)
         sm_key = _async_script_manager_field(payload)
-        payload["__EVENTTARGET"] = pager.pager_target
-        payload["__EVENTARGUMENT"] = pager.next_argument or parse_pager_next_argument(
-            html
-        )
+        payload["__EVENTTARGET"] = event_target
+        payload["__EVENTARGUMENT"] = event_argument
         payload["__ASYNCPOST"] = "true"
         payload[sm_key] = (
-            f"{DEFAULT_QUANTITATIVE_REVIEW_UPDATE_PANEL}|{pager.pager_target}"
+            f"{DEFAULT_QUANTITATIVE_REVIEW_UPDATE_PANEL}|{event_target}"
         )
-        post_url = getattr(self, "_quantitative_review_post_url", None) or (
-            urljoin(self.base_url, pager.action)
-            if pager.action
-            else quantitative_review_frame_url(self.base_url)
-        )
-        if pager.action:
-            post_url = urljoin(post_url, pager.action)
+        post_url = self._quantitative_review_post_url_for(html)
         headers = {
             "Referer": post_url,
             "X-MicrosoftAjax": "Delta=true",
@@ -1196,23 +1357,21 @@ class SystemGroupClient:
             resp.raise_for_status()
         except requests.RequestException as exc:
             raise SystemGroupClientError(
-                f"Could not fetch next QuantitativeReview page: {exc}"
+                f"Could not {label} QuantitativeReview: {exc}"
             ) from exc
         if "login.aspx" in (resp.url or "").lower():
             raise SystemGroupClientError(
-                "QuantitativeReview Next redirected to login; check credentials."
+                f"QuantitativeReview {label} redirected to login; check credentials."
             )
         delta = resp.text
         if "view state is expired" in delta.lower():
             raise SystemGroupClientError(
-                "QuantitativeReview Next failed: page ViewState expired. "
+                f"QuantitativeReview {label} failed: page ViewState expired. "
                 "Use the PageID/TimeStamp Review URL."
             )
-        if "|error|" in delta or (
-            "updatePanel" not in delta and "EntityListPaging" not in delta
-        ):
+        if "|error|" in delta:
             raise SystemGroupClientError(
-                "QuantitativeReview Next postback failed: CRM returned an error delta."
+                f"QuantitativeReview {label} failed: CRM returned an error delta."
             )
         try:
             merged = apply_async_entity_list_delta(
@@ -1221,18 +1380,223 @@ class SystemGroupClient:
                 panel_ids=(DEFAULT_QUANTITATIVE_REVIEW_UPDATE_PANEL,),
             )
         except SystemGroupClientError:
-            if "EntityListPaging" in delta or "rgRow" in delta:
+            if "EntityListPaging" in delta or "rgRow" in delta or "updatePanel" in delta:
                 return delta, resp.headers.get("Content-Type", "text/html")
             raise
         return merged, "text/html"
+
+    def _post_quantitative_review_next(
+        self, html: str, pager: BomListPager
+    ) -> tuple[str, str]:
+        """Async-post EntityListPaging Next on QuantitativeReview."""
+        if not pager.pager_target:
+            raise SystemGroupClientError(
+                "QuantitativeReview pager has no postback target for Next."
+            )
+        return self._post_quantitative_review_async(
+            html,
+            event_target=pager.pager_target,
+            event_argument=pager.next_argument or parse_pager_next_argument(html),
+            label="Next",
+        )
+
+    def resolve_store_id_by_number(self, store_number: str) -> str:
+        """Resolve انبار Number (e.g. ``2001``) to Store entity id via EntityList."""
+        code = (store_number or "").strip()
+        if not code:
+            raise SystemGroupClientError("Store number is required.")
+        if not self._logged_in:
+            self.login()
+        url = store_list_frame_url(self.base_url)
+        try:
+            resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            raise SystemGroupClientError(
+                f"Could not open Store list ({url.split('?', 1)[0]}): {exc}"
+            ) from exc
+        if "login.aspx" in (resp.url or "").lower():
+            raise SystemGroupClientError(
+                "Store list redirected to login; check credentials."
+            )
+        body = resp.text
+        # Reuse BoM Number filter postback shape (same SgGridView EntityList).
+        prev_frame = self._bom_list_frame_url
+        self._bom_list_frame_url = resp.url or url
+        try:
+            filtered, _ctype = self._post_bom_list_part_code_filter(
+                body, code, filter_function="EqualTo", column="Number"
+            )
+        except SystemGroupClientError:
+            try:
+                filtered, _ctype = self._post_bom_list_part_code_filter(
+                    body, code, filter_function="StartsWith", column="Number"
+                )
+            except SystemGroupClientError as exc:
+                raise SystemGroupClientError(
+                    f"Could not filter Store list by Number={code!r}. "
+                    "Set CRM_STORE_LIST_PATH if the Store EntityList URL differs."
+                ) from exc
+        finally:
+            self._bom_list_frame_url = prev_frame
+
+        # First data row, first cell is usually the entity id (same as BoM list).
+        row = re.search(
+            r'<tr[^>]*\bclass="[^"]*(?:rgRow|rgAltRow)[^"]*"[^>]*>\s*'
+            r"<td[^>]*>\s*([^<]+?)\s*</td>",
+            filtered,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not row:
+            raise SystemGroupClientError(
+                f"Store Number {code!r} not found in Store EntityList."
+            )
+        store_id = re.sub(r"[\u200e\u200f\s,]", "", unescape(row.group(1))).strip()
+        if not store_id:
+            raise SystemGroupClientError(
+                f"Store Number {code!r} matched a row with empty id."
+            )
+        return store_id
+
+    def _quantitative_review_select_tab(
+        self, html: str, tab_index: int, *, label: str
+    ) -> str:
+        """Async-select ``tabStrip`` index and return merged HTML."""
+        idx = str(int(tab_index))
+        updates = {
+            _QR_TAB_STRIP_CLIENTSTATE: json.dumps(
+                {"selectedIndexes": [idx], "logEntries": [], "scrollState": {}},
+                separators=(",", ":"),
+            ),
+            _QR_MULTI_PAGE_CLIENTSTATE: json.dumps(
+                {"selectedIndex": int(tab_index), "changeLog": []},
+                separators=(",", ":"),
+            ),
+        }
+        merged, _ = self._post_quantitative_review_async(
+            html,
+            event_target="tabStrip",
+            event_argument=idx,
+            field_updates=updates,
+            label=label,
+        )
+        return merged
+
+    def _apply_quantitative_review_warehouse_filter(
+        self, html: str, warehouse_code: str
+    ) -> str:
+        """Filter QuantitativeReview to one انبار Number via tabStrip sheetViewer1.
+
+        Live CRM flow: select انبار tab → ``DefaultCommand`` on the Store row →
+        PathDiv gains the warehouse condition → return to کالا tab for inventory.
+        """
+        code = (warehouse_code or "").strip()
+        if not code:
+            raise SystemGroupClientError("warehouse_code is required.")
+
+        controls = discover_quantitative_review_store_filter_fields(html)
+        if "tab_clientstate" not in controls:
+            raise SystemGroupClientError(
+                "QuantitativeReview HTML has no tabStrip (انبار/کالا tabs). "
+                "Run scripts/probe_quantitative_review_store_filter.py on LAN."
+            )
+
+        store_tab = int(controls.get("store_tab_index") or "1")
+        part_tab = int(controls.get("part_tab_index") or "4")
+        html = self._quantitative_review_select_tab(
+            html, store_tab, label="select انبار tab"
+        )
+        controls = discover_quantitative_review_store_filter_fields(html)
+
+        store_id = store_id_from_quantitative_review_sheet(html, code)
+        if store_id is None:
+            if code.isdigit() and len(code) > 6:
+                store_id = code
+            else:
+                store_id = self.resolve_store_id_by_number(code)
+        try:
+            record_id: int | str = int(store_id)
+        except ValueError:
+            record_id = store_id
+
+        _, fields = extract_aspnet_post_fields(html)
+        fields = strip_clientstate_updated(fields)
+        settings_key = controls.get("store_settings") or next(
+            (
+                k
+                for k in fields
+                if k.startswith(f"{_QR_STORE_SHEET}_GridSettingsHiddenFieldKey_")
+            ),
+            None,
+        )
+        cs_key = controls.get("store_clientstate") or f"{_QR_STORE_SHEET}_ClientState"
+        if not settings_key or cs_key not in fields:
+            raise SystemGroupClientError(
+                "QuantitativeReview انبار tab has no sheetViewer1 Store grid "
+                f"(settings={settings_key!r}, clientState={cs_key in fields})."
+            )
+
+        updates: dict[str, str] = {}
+        try:
+            settings = json.loads(fields[settings_key] or "{}")
+        except json.JSONDecodeError:
+            settings = {}
+        if isinstance(settings, dict):
+            settings = dict(settings)
+            settings["SelectedRecordIDs"] = [record_id]
+            updates[settings_key] = json.dumps(
+                settings, ensure_ascii=False, separators=(",", ":")
+            )
+        try:
+            cs = json.loads(fields[cs_key] or "{}")
+        except json.JSONDecodeError:
+            cs = {}
+        if isinstance(cs, dict):
+            cs = dict(cs)
+            cs.pop("__Updated", None)
+            cs["lastPostBackSelectedRecordIDs"] = [record_id]
+            updates[cs_key] = json.dumps(
+                cs, ensure_ascii=False, separators=(",", ":")
+            )
+
+        html, _ = self._post_quantitative_review_async(
+            html,
+            event_target=_QR_STORE_SHEET,
+            event_argument=json.dumps(
+                {"commandName": "DefaultCommand", "recordID": record_id},
+                separators=(",", ":"),
+            ),
+            field_updates=updates,
+            label=f"warehouse filter {code}",
+        )
+        path = re.search(
+            r'id="PathDiv"[^>]*>(.*?)</span>', html or "", re.DOTALL
+        )
+        path_text = (
+            re.sub(r"<[^>]+>", " ", path.group(1)) if path else ""
+        )
+        if "هیچ شرطی" in path_text or "انبار" not in path_text:
+            raise SystemGroupClientError(
+                f"QuantitativeReview store DefaultCommand for {code!r} "
+                "did not update PathDiv."
+            )
+
+        return self._quantitative_review_select_tab(
+            html, part_tab, label="select کالا tab"
+        )
 
     def iter_quantitative_review_pages(
         self,
         path: str | None = None,
         *,
         max_pages: int | None = None,
+        warehouse_code: str | None = None,
     ) -> Iterator[tuple[str, str]]:
-        """Yield (body, content_type) for every QuantitativeReview pager page."""
+        """Yield (body, content_type) for every QuantitativeReview pager page.
+
+        When ``warehouse_code`` is set (انبار Number, e.g. ``2001`` / ``2002``),
+        select that Store on the انبار tab (PathDiv) before paging.
+        """
         if not self._logged_in:
             self.login()
         limit = (
@@ -1241,6 +1605,11 @@ class SystemGroupClient:
             else max(1, max_pages)
         )
         body, ctype = self.fetch_quantitative_review(path)
+        if warehouse_code:
+            body = self._apply_quantitative_review_warehouse_filter(
+                body, warehouse_code
+            )
+            ctype = "text/html"
         yield body, ctype
 
         seen_pages: set[int] = set()
@@ -1266,11 +1635,16 @@ class SystemGroupClient:
         path: str | None = None,
         *,
         max_pages: int | None = None,
+        warehouse_code: str | None = None,
     ) -> list[InventoryLine]:
-        """Page QuantitativeReview and return all inventory lines."""
+        """Page QuantitativeReview and return inventory lines.
+
+        ``warehouse_code`` limits rows to one انبار Number (tabStrip انبار →
+        Store ``DefaultCommand``), e.g. Inco raw ``2001`` / products ``2002``.
+        """
         lines: list[InventoryLine] = []
         for body, _ctype in self.iter_quantitative_review_pages(
-            path, max_pages=max_pages
+            path, max_pages=max_pages, warehouse_code=warehouse_code
         ):
             page_lines = parse_quantitative_review_document(body)
             if not page_lines and lines:
