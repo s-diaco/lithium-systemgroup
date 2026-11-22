@@ -1,11 +1,12 @@
-"""Parse SystemGroup login forms, BoM Edit/List, and customer-order report exports.
+"""Parse SystemGroup login forms, BoM Edit/List, inventory review, and orders.
 
 Edit: prefer ``window.eds_BomMaterials_updatedData`` (PartCode/Quantity);
 rgRow cells are often empty. Header via ``nrgNumber`` / ``sltBomPart``.
-List: Telerik ``MasterTableView_Header`` + ``rgRow``. Orders: ReportViewer
+List: Telerik ``MasterTableView_Header`` + ``rgRow``. Inventory:
+QuantitativeReview ``rgRow`` (code / title / مانده). Orders: ReportViewer
 CSV export (store delivery notes with remaining balance). Fixtures:
 ``bom_edit_telerik.html``, ``bom_edit_materials.json``, ``bom_list_telerik.*``,
-``customer_orders.csv``.
+``quantitative_review.html``, ``customer_orders.csv``.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import io
 import json
 import re
 from dataclasses import dataclass, field
+from html import unescape
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import unquote, urlparse, parse_qs
@@ -140,6 +142,18 @@ class CustomerOrderLine:
             "delivery_note_number": self.delivery_note_number.strip(),
             "notes": self.notes.strip(),
         }
+
+
+@dataclass(frozen=True)
+class InventoryLine:
+    """One row from Logistics QuantitativeReview (مرور تعدادی انبار)."""
+
+    part_code: str
+    title: str = ""
+    quantity: float = 0.0
+    nature: str = ""
+    unit: str = ""
+    entity_id: str = ""
 
 
 # --- Login form ---------------------------------------------------------------
@@ -1554,4 +1568,99 @@ def parse_customer_orders_document(
             "Customer orders XML export is not supported; use CSV (export_format='CSV')."
         )
     return _parse_customer_orders_csv(stripped)
+
+
+# --- Quantitative inventory review (SgGridView HTML) ---------------------------
+
+_INV_ROW = re.compile(
+    r'<tr[^>]*\bclass="[^"]*\brg(?:Alt)?Row\b[^"]*"[^>]*>(.*?)</tr>',
+    re.I | re.S,
+)
+_INV_CELL = re.compile(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", re.I | re.S)
+_INV_TAG = re.compile(r"<[^>]+>")
+_INV_WS = re.compile(r"[\u200e\u200f\s]+")
+
+
+def _inventory_cell_text(html: str) -> str:
+    text = _INV_TAG.sub(" ", unescape(html or ""))
+    return _INV_WS.sub(" ", text).strip()
+
+
+def inventory_quantity(raw: str) -> float:
+    """Parse QuantitativeReview مانده cell (commas / bidi marks)."""
+    text = normalize_order_quantity(raw)
+    if not text or text in {"—", "-"}:
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def parse_quantitative_review_document(
+    content: str,
+    *,
+    content_type: str | None = None,
+) -> list[InventoryLine]:
+    """Parse one QuantitativeReview HTML page into inventory lines.
+
+    Expected MasterTableView columns (0-based): entity id, part code, title,
+    technical spec, nature, nature2, unit, …, مانده (اصلی) at index 11.
+    """
+    del content_type  # HTML only today; kept for API symmetry with other parsers.
+    html = content or ""
+    lines: list[InventoryLine] = []
+    for match in _INV_ROW.finditer(html):
+        cells = [_inventory_cell_text(c) for c in _INV_CELL.findall(match.group(1))]
+        if len(cells) < 12:
+            continue
+        code = cells[1].strip()
+        if not code:
+            continue
+        lines.append(
+            InventoryLine(
+                part_code=code,
+                title=cells[2],
+                quantity=inventory_quantity(cells[11]),
+                nature=cells[4],
+                unit=cells[6],
+                entity_id=cells[0],
+            )
+        )
+    return lines
+
+
+def filter_inventory_lines(
+    lines: list[InventoryLine],
+    *,
+    code_prefixes: tuple[str, ...] | list[str] | None = None,
+    text_regex: str | re.Pattern[str] | None = None,
+) -> list[InventoryLine]:
+    """Filter inventory lines by code prefix and/or code+title regex.
+
+    Prefix match is case-insensitive on ``part_code``. ``text_regex`` is searched
+    against ``part_code + " " + title``. Either or both may be set; both must
+    match when both are set.
+    """
+    prefixes = tuple(p for p in (code_prefixes or ()) if p)
+    pattern: re.Pattern[str] | None
+    if text_regex is None:
+        pattern = None
+    elif isinstance(text_regex, re.Pattern):
+        pattern = text_regex
+    else:
+        pattern = re.compile(text_regex, re.I)
+
+    out: list[InventoryLine] = []
+    for line in lines:
+        if prefixes and not any(
+            line.part_code.lower().startswith(p.lower()) for p in prefixes
+        ):
+            continue
+        if pattern is not None and not pattern.search(
+            f"{line.part_code} {line.title}"
+        ):
+            continue
+        out.append(line)
+    return out
 

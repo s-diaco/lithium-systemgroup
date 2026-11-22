@@ -1,4 +1,4 @@
-"""ASP.NET forms-auth client for SystemGroup PAC Engineering BoM and report pages."""
+"""ASP.NET forms-auth client for SystemGroup BoM, inventory review, and reports."""
 
 from __future__ import annotations
 
@@ -9,12 +9,18 @@ import time
 from dataclasses import dataclass
 from html import escape as html_escape
 from html import unescape
-from typing import Iterator
+from typing import Iterator, Sequence
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 
-from .parser import LoginFormFields, SystemGroupParseError, parse_login_form
+from .parser import (
+    InventoryLine,
+    LoginFormFields,
+    SystemGroupParseError,
+    parse_login_form,
+    parse_quantitative_review_document,
+)
 from .rsa_login import build_hashed_password, unicode_correct_invalid_characters
 
 
@@ -59,6 +65,15 @@ DEFAULT_CUSTOMER_ORDERS_REPORT_PATH = (
     "%D8%AD%D9%88%D8%A7%D9%84%D9%87+%D9%81%D8%B1%D9%88%D8%B4"
     "%28%D8%A8%D8%A7+%D9%85%D8%A7%D9%86%D8%AF%D9%87+%29"
 )
+# Logistics quantitative inventory review (مرور تعدادی انبار); path only.
+DEFAULT_QUANTITATIVE_REVIEW_PATH = (
+    "Logistics/InventoryReports/QuantitativeReview/Review.aspx"
+)
+DEFAULT_QUANTITATIVE_REVIEW_UPDATE_PANEL = "SgUpdatePanel1"
+DEFAULT_QUANTITATIVE_REVIEW_MAX_PAGES = 500
+DEFAULT_QUANTITATIVE_REVIEW_PAGE_ID = "1"
+DEFAULT_QUANTITATIVE_REVIEW_PAGE_WIDTH = "1050"
+DEFAULT_QUANTITATIVE_REVIEW_PAGE_HEIGHT = "670"
 
 _EXPORT_URL_BASE = re.compile(
     r'ExportUrlBase["\']?\s*:\s*["\']([^"\']+)["\']',
@@ -311,25 +326,35 @@ _PAGER_SCRIPT = re.compile(
 )
 
 
-def apply_bom_list_async_delta(html: str, delta: str) -> str:
-    """Merge an async Next/Filter delta into list HTML for the next postback round."""
-    panel = extract_async_update_panel(delta)
-    if not panel:
-        # PartCode header filter refreshes the outer UpdatePanel id.
-        panel = extract_async_update_panel(delta, _BOM_LIST_OUTER_UPDATE_PANEL_ID)
+def apply_async_entity_list_delta(
+    html: str,
+    delta: str,
+    *,
+    panel_ids: Sequence[str],
+    keep_pager_scripts: bool = True,
+) -> str:
+    """Merge an ASP.NET async EntityListPaging delta into HTML for the next round."""
+    panel: str | None = None
+    for panel_id in panel_ids:
+        panel = extract_async_update_panel(delta, panel_id)
+        if panel:
+            break
     if not panel:
         raise SystemGroupClientError(
-            "BoM list Next postback returned no updatePanel delta."
+            "Entity list postback returned no updatePanel delta "
+            f"(tried: {', '.join(panel_ids)})."
         )
     action, fields = extract_aspnet_post_fields(html)
     fields.update(extract_async_hidden_fields(delta))
     fields.update(extract_aspnet_post_fields(panel)[1])
+    fields = strip_clientstate_updated(fields)
     # Drop event target leftovers from the previous post.
     fields["__EVENTTARGET"] = ""
     fields["__EVENTARGUMENT"] = ""
     fields.pop("__ASYNCPOST", None)
-    if "scriptManager" in fields and "|" in (fields.get("scriptManager") or ""):
-        fields["scriptManager"] = ""
+    for key in list(fields):
+        if key.lower().startswith("scriptmanager") and "|" in (fields.get(key) or ""):
+            fields[key] = ""
     hidden = "".join(
         f'<input type="hidden" name="{html_escape(name, quote=True)}" '
         f'value="{html_escape(value, quote=True)}" />'
@@ -339,16 +364,39 @@ def apply_bom_list_async_delta(html: str, delta: str) -> str:
     # from the prior page so parse_bom_list_pager still finds pager_target.
     # Skip any "script" match that embeds grid rows (over-broad scrape would
     # re-inject the unfiltered catalog after a PartCode filter delta).
-    pager_scripts = "".join(
-        s
-        for s in _PAGER_SCRIPT.findall(html or "")
-        if "rgRow" not in s and "rgAltRow" not in s
-    )
+    pager_scripts = ""
+    if keep_pager_scripts:
+        pager_scripts = "".join(
+            s
+            for s in _PAGER_SCRIPT.findall(html or "")
+            if "rgRow" not in s and "rgAltRow" not in s
+        )
     action_attr = html_escape(action or "", quote=True)
     return (
         f'<form method="post" action="{action_attr}">'
         f"{hidden}{panel}{pager_scripts}</form>"
     )
+
+
+def apply_bom_list_async_delta(html: str, delta: str) -> str:
+    """Merge an async Next/Filter delta into BoM list HTML for the next postback."""
+    return apply_async_entity_list_delta(
+        html,
+        delta,
+        panel_ids=(_BOM_LIST_UPDATE_PANEL_ID, _BOM_LIST_OUTER_UPDATE_PANEL_ID),
+    )
+
+
+def _async_script_manager_field(fields: dict[str, str]) -> str:
+    """Pick the ScriptManager post field used for ``panel|target`` async posts."""
+    if "ScriptManager1" in fields:
+        return "ScriptManager1"
+    if "scriptManager" in fields:
+        return "scriptManager"
+    for key in fields:
+        if key.startswith("ScriptManager") and not key.endswith("_TSM"):
+            return key
+    return "scriptManager"
 
 
 def extract_bom_id_from_url(url: str) -> str | None:
@@ -496,6 +544,35 @@ def bom_list_frame_url(
     )
 
 
+def quantitative_review_path_from_env() -> str:
+    """Optional override path (no host) for QuantitativeReview."""
+    return (
+        os.environ.get("CRM_QUANTITATIVE_REVIEW_PATH")
+        or os.environ.get("REPORT_QUANTITATIVE_REVIEW_PATH")
+        or DEFAULT_QUANTITATIVE_REVIEW_PATH
+    ).lstrip("/")
+
+
+def quantitative_review_frame_url(
+    base_url: str,
+    *,
+    path: str | None = None,
+    page_id: str = DEFAULT_QUANTITATIVE_REVIEW_PAGE_ID,
+    timestamp_ms: int | None = None,
+    page_width: str = DEFAULT_QUANTITATIVE_REVIEW_PAGE_WIDTH,
+    page_height: str = DEFAULT_QUANTITATIVE_REVIEW_PAGE_HEIGHT,
+) -> str:
+    """Direct Review.aspx URL with PageID/TimeStamp (ViewState key), not Shell."""
+    ts = int(time.time() * 1000) if timestamp_ms is None else int(timestamp_ms)
+    review_path = (path or quantitative_review_path_from_env()).lstrip("/")
+    return urljoin(
+        base_url,
+        f"{review_path}"
+        f"?PageID={page_id}&TimeStamp={ts}"
+        f"&PageWidth={page_width}&PageHeight={page_height}",
+    )
+
+
 class SystemGroupClient:
     """Session-backed forms-auth client."""
 
@@ -527,6 +604,7 @@ class SystemGroupClient:
             self.session.headers["User-Agent"] = DEFAULT_USER_AGENT
         self._logged_in = False
         self._bom_list_frame_url: str | None = None
+        self._quantitative_review_post_url: str | None = None
 
     def login_url(self) -> str:
         return urljoin(self.base_url, DEFAULT_LOGIN_PATH.lstrip("/"))
@@ -1053,6 +1131,152 @@ class SystemGroupClient:
             text = resp.content.decode("utf-8-sig")
             return text, ctype
         return resp.text, ctype
+
+    def fetch_quantitative_review(
+        self, path: str | None = None
+    ) -> tuple[str, str]:
+        """GET QuantitativeReview first page (PageID/TimeStamp); return (html, ctype)."""
+        if not self._logged_in:
+            self.login()
+        url = quantitative_review_frame_url(self.base_url, path=path)
+        try:
+            resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            raise SystemGroupClientError(
+                f"Could not open QuantitativeReview ({url.split('?', 1)[0]}): {exc}"
+            ) from exc
+        if "login.aspx" in (resp.url or "").lower():
+            raise SystemGroupClientError(
+                "QuantitativeReview redirected to login; check credentials."
+            )
+        self._quantitative_review_post_url = resp.url or url
+        return resp.text, resp.headers.get("Content-Type", "text/html")
+
+    def _post_quantitative_review_next(
+        self, html: str, pager: BomListPager
+    ) -> tuple[str, str]:
+        """Async-post EntityListPaging Next on QuantitativeReview."""
+        if not pager.pager_target:
+            raise SystemGroupClientError(
+                "QuantitativeReview pager has no postback target for Next."
+            )
+        _, fields = extract_aspnet_post_fields(html)
+        payload = strip_clientstate_updated(fields)
+        sm_key = _async_script_manager_field(payload)
+        payload["__EVENTTARGET"] = pager.pager_target
+        payload["__EVENTARGUMENT"] = pager.next_argument or parse_pager_next_argument(
+            html
+        )
+        payload["__ASYNCPOST"] = "true"
+        payload[sm_key] = (
+            f"{DEFAULT_QUANTITATIVE_REVIEW_UPDATE_PANEL}|{pager.pager_target}"
+        )
+        post_url = getattr(self, "_quantitative_review_post_url", None) or (
+            urljoin(self.base_url, pager.action)
+            if pager.action
+            else quantitative_review_frame_url(self.base_url)
+        )
+        if pager.action:
+            post_url = urljoin(post_url, pager.action)
+        headers = {
+            "Referer": post_url,
+            "X-MicrosoftAjax": "Delta=true",
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        try:
+            resp = self.session.post(
+                post_url,
+                data=payload,
+                headers=headers,
+                timeout=self.timeout,
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            raise SystemGroupClientError(
+                f"Could not fetch next QuantitativeReview page: {exc}"
+            ) from exc
+        if "login.aspx" in (resp.url or "").lower():
+            raise SystemGroupClientError(
+                "QuantitativeReview Next redirected to login; check credentials."
+            )
+        delta = resp.text
+        if "view state is expired" in delta.lower():
+            raise SystemGroupClientError(
+                "QuantitativeReview Next failed: page ViewState expired. "
+                "Use the PageID/TimeStamp Review URL."
+            )
+        if "|error|" in delta or (
+            "updatePanel" not in delta and "EntityListPaging" not in delta
+        ):
+            raise SystemGroupClientError(
+                "QuantitativeReview Next postback failed: CRM returned an error delta."
+            )
+        try:
+            merged = apply_async_entity_list_delta(
+                html,
+                delta,
+                panel_ids=(DEFAULT_QUANTITATIVE_REVIEW_UPDATE_PANEL,),
+            )
+        except SystemGroupClientError:
+            if "EntityListPaging" in delta or "rgRow" in delta:
+                return delta, resp.headers.get("Content-Type", "text/html")
+            raise
+        return merged, "text/html"
+
+    def iter_quantitative_review_pages(
+        self,
+        path: str | None = None,
+        *,
+        max_pages: int | None = None,
+    ) -> Iterator[tuple[str, str]]:
+        """Yield (body, content_type) for every QuantitativeReview pager page."""
+        if not self._logged_in:
+            self.login()
+        limit = (
+            DEFAULT_QUANTITATIVE_REVIEW_MAX_PAGES
+            if max_pages is None
+            else max(1, max_pages)
+        )
+        body, ctype = self.fetch_quantitative_review(path)
+        yield body, ctype
+
+        seen_pages: set[int] = set()
+        for _ in range(limit - 1):
+            pager = parse_bom_list_pager(body)
+            if pager is None or not pager.next_enabled or not pager.pager_target:
+                break
+            if pager.current_page in seen_pages:
+                break
+            seen_pages.add(pager.current_page)
+            if pager.current_page >= pager.page_count:
+                break
+            body, ctype = self._post_quantitative_review_next(body, pager)
+            next_pager = parse_bom_list_pager(body)
+            if next_pager is not None and next_pager.current_page == pager.current_page:
+                break
+            if not parse_quantitative_review_document(body):
+                break
+            yield body, ctype
+
+    def fetch_quantitative_review_lines(
+        self,
+        path: str | None = None,
+        *,
+        max_pages: int | None = None,
+    ) -> list[InventoryLine]:
+        """Page QuantitativeReview and return all inventory lines."""
+        lines: list[InventoryLine] = []
+        for body, _ctype in self.iter_quantitative_review_pages(
+            path, max_pages=max_pages
+        ):
+            page_lines = parse_quantitative_review_document(body)
+            if not page_lines and lines:
+                break
+            lines.extend(page_lines)
+        return lines
 
 
 def rewrite_url_host(url: str, base_url: str) -> str:
