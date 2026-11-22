@@ -59,9 +59,15 @@ for row in orders:
 # Quantitative inventory review (مرور تعدادی انبار)
 from lithium_systemgroup import filter_inventory_lines
 
-stock = client.fetch_quantitative_review_lines()
-products = filter_inventory_lines(stock, code_prefixes=("ICJ/", "RMJ/"))
-raw = filter_inventory_lines(stock, text_regex=r"ICQ|RMS/")
+# Optional warehouse_code = انبار Number (tabStrip انبار → Store DefaultCommand).
+products = filter_inventory_lines(
+    client.fetch_quantitative_review_lines(warehouse_code="2002"),
+    code_prefixes=("ICJ/", "RMJ/"),
+)
+raw = filter_inventory_lines(
+    client.fetch_quantitative_review_lines(warehouse_code="2001"),
+    text_regex=r"ICQ|RMS/",
+)
 for row in products:
     print(row.part_code, row.quantity)
 ```
@@ -76,6 +82,7 @@ for row in products:
 | `REPORT_USERNAME` / `REPORT_PASSWORD` | Forms-auth for the report host. Fall back to `CRM_*`. |
 | `REPORT_ORDERS_PATH` | Optional ReportViewer path (no host). Default: store delivery-note report under `/CustomerReports/Store/…`. |
 | `CRM_QUANTITATIVE_REVIEW_PATH` | Optional QuantitativeReview path (no host). Default: `Logistics/InventoryReports/QuantitativeReview/Review.aspx`. Falls back to `REPORT_QUANTITATIVE_REVIEW_PATH`. |
+| `CRM_STORE_LIST_PATH` | Optional Store EntityList path (no host) used when resolving انبار Number → id. Default: `List.aspx?ComponentName=SystemGroup.Logistics.InventoryManagement&EntityName=Store`. |
 
 Never commit credentials. Prefer a gitignored env file or the process environment.
 
