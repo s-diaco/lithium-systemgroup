@@ -138,4 +138,4 @@ __all__ = [
     "unicode_correct_invalid_characters",
 ]
 
-__version__ = "0.2.10"
+__version__ = "0.2.11"

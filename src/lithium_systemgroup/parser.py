@@ -336,6 +336,8 @@ _HEADER_ALIASES: dict[str, tuple[str, ...]] = {
         "مصرفاستاندارد",
     ),
     "revision": ("revision", "rev", "rev.", "نسخه"),
+    # «نام کالا» / PartName is the real part description. Do not alias
+    # «عنوان کالا» / Title here — that field is description + " " + PN + "/" + rev.
     "description": (
         "description",
         "desc",
@@ -343,8 +345,8 @@ _HEADER_ALIASES: dict[str, tuple[str, ...]] = {
         "name_material",
         "partname",
         "part_name",
-        "عنوان کالا",
-        "عنوانکالا",
+        "نام کالا",
+        "نامکالا",
         "شرح",
         "توضیحات",
     ),
@@ -408,7 +410,8 @@ def _line_from_mapping(data: dict[str, Any], default_level: int = 1) -> BomLine:
                 normalized["part_number"] = str(data[key]).strip()
                 break
     if not normalized.get("description"):
-        for key in ("PartName", "partName", "Title"):
+        # PartName = «نام کالا»; never Title / «عنوان …» (composite with PN/rev).
+        for key in ("PartName", "partName"):
             if data.get(key) not in (None, ""):
                 normalized["description"] = str(data[key]).strip()
                 break
@@ -660,7 +663,8 @@ def _apply_edit_header_fields(bom: ParsedBom, html: str) -> None:
     fields = _form_field_map(html)
     part = (fields.get("sltBomPart") or "").strip()
     number = (fields.get("nrgNumber") or "").strip()
-    title = (fields.get("txtTitle") or fields.get("txtBomPartName") or "").strip()
+    # txtBomPartName holds «نام کالا»; txtTitle is «عنوان …» (desc + PN/rev).
+    nam_kala = (fields.get("txtBomPartName") or "").strip()
     if part and not bom.parent_part_number:
         bom.parent_part_number = part
     if number:
@@ -673,8 +677,8 @@ def _apply_edit_header_fields(bom: ParsedBom, html: str) -> None:
         if code_pn and code_rev:
             bom.parent_part_number = code_pn
             bom.parent_revision = code_rev
-    if title and not bom.parent_description:
-        bom.parent_description = title
+    if nam_kala and not bom.parent_description:
+        bom.parent_description = nam_kala
     if not bom.bom_id:
         # Prefer BomRef from materials blob later; id= in Edit URL as fallback.
         id_m = re.search(r"[?&]id=(\d+)", html or "", re.I)
@@ -805,15 +809,15 @@ _LIST_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
         "کد کالا",
         "کدکالا",
     ),
-    # «عنوان BOM» is the list title; do not map bare «title» alone before this.
+    # «نام کالا» / PartName — not «عنوان BOM» / Title (desc + PN/rev composite).
     "description": (
         "description",
         "desc",
         "name",
-        "title",
-        "bom title",
-        "عنوان bom",
-        "عنوانbom",
+        "partname",
+        "part_name",
+        "نام کالا",
+        "نامکالا",
         "شرح",
         "توضیحات",
     ),
@@ -1154,9 +1158,10 @@ def _entry_from_list_mapping(data: dict[str, Any]) -> BomListEntry | None:
 
     description = str(
         data.get("description")
+        or data.get("PartName")
+        or data.get("partName")
+        or data.get("نام کالا")
         or data.get("name")
-        or data.get("title")
-        or data.get("Title")
         or ""
     ).strip()
 
