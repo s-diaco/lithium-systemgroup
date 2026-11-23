@@ -1,5 +1,7 @@
 # Contributing
 
+Cloud agents: follow `.cursor/skills/conventional-pr-titles/SKILL.md` for release-please PR titles.
+
 ## Conventional commits
 
 Use [Conventional Commits](https://www.conventionalcommits.org/) on `main` (usually via the PR title / squash message):
