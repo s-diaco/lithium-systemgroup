@@ -148,7 +148,10 @@ class BomParseTests(unittest.TestCase):
         self.assertEqual(bom.source, "html-eds-materials")
         self.assertEqual(bom.parent_part_number, "1155F229")
         self.assertEqual(bom.parent_revision, "A2*10-C")
+        # Parent description from txtBomPartName («نام کالا»), not txtTitle composite.
+        self.assertEqual(bom.parent_description, "فریت اپک انگوب")
         self.assertEqual(len(bom.lines), 3)
+        self.assertEqual(bom.lines[0].description, "براکس پنتا (اتی بانک)")
 
     def test_normalize_crm_decimal(self):
         self.assertEqual(normalize_crm_decimal("70/000000000000000"), "70")
@@ -198,6 +201,8 @@ class BomListParseTests(unittest.TestCase):
         entries = parse_bom_list_document(raw, content_type="application/json")
         self.assertEqual(entries[0].part_number, "1155F229")
         self.assertEqual(entries[0].revision, "A2*10-C")
+        # Description from PartName («نام کالا»), not Title («عنوان BOM» composite).
+        self.assertEqual(entries[0].description, "فریت اپک انگوب")
         # Concatenated Number with no slash: PartCode is PN, tail is revision.
         by_id = {e.bom_id: e for e in entries}
         concat = by_id["39482"]
@@ -205,10 +210,37 @@ class BomListParseTests(unittest.TestCase):
         self.assertEqual(concat.revision, "*2-C")
         self.assertEqual(concat.number, "2183S914*2-C")
         self.assertEqual(entry_bom_number(concat), "2183S914*2-C")
+        self.assertEqual(concat.description, "فریت ترانس")
         # Number equals PartCode → empty revision.
         bare = by_id["39484"]
         self.assertEqual(bare.part_number, "CGM5883")
         self.assertEqual(bare.revision, "")
+        self.assertEqual(bare.description, "مجموعه مات اپک ابریشمی")
+
+    def test_list_description_prefers_partname_not_title(self):
+        """«نام کالا»/PartName wins; Title (desc+PN/rev) is ignored."""
+        from lithium_systemgroup.parser import _entry_from_list_mapping
+
+        entry = _entry_from_list_mapping(
+            {
+                "id": "9",
+                "PartCode": "1155F229",
+                "PartName": "فریت اپک انگوب",
+                "Number": "1155F229/A2*10-C",
+                "Title": "فریت اپک 1155F229/A2*10-C",
+            }
+        )
+        self.assertEqual(entry.description, "فریت اپک انگوب")
+
+        nam_header = _entry_from_list_mapping(
+            {
+                "id": "10",
+                "part_number": "X",
+                "نام کالا": "نام واقعی",
+                "Title": "نام واقعی X/A",
+            }
+        )
+        self.assertEqual(nam_header.description, "نام واقعی")
 
     def test_entry_prefers_partcode_over_number_slash(self):
         """List rows: کد کالا is PN; Number tail (after PN + optional /) is rev."""
