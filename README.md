@@ -109,6 +109,10 @@ pytest
 
 Fixtures under `tests/fixtures/` are trimmed CRM / report samples (LAN-only host).
 
+## Versioning & releases
+
+Versions are driven by [release-please](https://github.com/googleapis/release-please) on pushes to `main`. Use conventional commits (`fix:` / `chore:` → patch, `feat:` → minor, `!` / `BREAKING CHANGE` → major). Do not bump the version in feature PRs — merge the release-please PR when you want a tagged release. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 GPL-3.0-or-later.
